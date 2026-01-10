@@ -26,7 +26,7 @@ import config
 from logHandler import log
 from synthDriverHandler import SynthDriver, VoiceInfo, synthDoneSpeaking, synthIndexReached
 from speech.commands import IndexCommand
-from autoSettingsUtils.driverSetting import DriverSetting, NumericDriverSetting
+from autoSettingsUtils.driverSetting import DriverSetting, NumericDriverSetting, BooleanDriverSetting
 
 # --- Wrapper Constants ---
 SV_ITEM_NONE = 0
@@ -75,6 +75,16 @@ _STRIP_CHARS = {"\ufeff", "\u00ad", "\u200b", "\u200c", "\u200d", "\u200e", "\u2
 _labelColonRe = re.compile(r"([A-Za-z]{2,})\s*:\s*([A-Za-z])")
 _labelSemiRe = re.compile(r"([A-Za-z]{2,})\s*;\s*([A-Za-z])")
 _spellWordRe = re.compile(r"[A-Za-z0-9]+")
+_acronymWordRe = re.compile(r"\b[A-Z]{2,5}\b")
+
+def _applyAcronymSpacing(s: str) -> str:
+    """Insert spaces into short ALL-CAPS words: NVDA -> N V D A.
+    This helps avoid SoftVoice expanding acronyms into unintended words.
+    """
+    def _repl(m: re.Match) -> str:
+        w = m.group(0)
+        return " ".join(list(w))
+    return _acronymWordRe.sub(_repl, s)
 
 # --- Number processing (optional) ---
 # SoftVoice sometimes spells long digit runs. We can pre-expand numbers into words before handing text to the engine.
@@ -233,6 +243,7 @@ class SynthDriver(SynthDriver):
         DriverSetting("gender", "Gender"),
         DriverSetting("glot", "Glottal Source"),
         DriverSetting("smode", "Speaking Mode"),
+        BooleanDriverSetting("useAbbreviations", "Use abbreviations"),
         DriverSetting("numproc", "Number processing"),
         NumericDriverSetting("pauseFactor", "Pause factor"),
     )
@@ -283,6 +294,7 @@ class SynthDriver(SynthDriver):
         self._afbiasPercent = 50
         self._ahbiasPercent = 50
         self._pauseFactorPercent = 50  # Default 50
+        self._useAbbreviations = True
         
         self._variant = "0"
         self._intstyle = "0"
@@ -311,6 +323,20 @@ class SynthDriver(SynthDriver):
         self.voice = self.curvoice
         self.pauseFactor = self._pauseFactorPercent
         self._initializing = False
+
+
+    def _getCapPitchChangePercent(self) -> int:
+        """Return NVDA's per-synth 'Capital pitch change percentage' (-100..100)."""
+        try:
+            v = int(config.conf["speech"][self.name].get("capPitchChange", 0))
+        except Exception:
+            try:
+                v = int(config.conf["speech"].get("capPitchChange", 0))
+            except Exception:
+                v = 0
+        if v < -100: v = -100
+        elif v > 100: v = 100
+        return v
 
     def _acquireWrapper(self):
         global _wrapperHandle, _wrapperRefCount, _wrapperDll, _wrapperLock
@@ -493,6 +519,22 @@ class SynthDriver(SynthDriver):
     def _speakBg(self, blocks):
         self.speaking = True
         is_word_mode = (str(self._smode) == "1")
+        basePitch = int(getattr(self, "_pitchPercent", 50))
+        capDelta = self._getCapPitchChangePercent()
+        appliedPitch = None
+        def applyPitchPercent(pct: int):
+            nonlocal appliedPitch
+            pct = self._clampPercent(pct)
+            if appliedPitch == pct or not getattr(self, "_handle", None):
+                return
+            try:
+                self._dll.sv_setPitch(self._handle, self._percentToParam(pct, 10, 2000))
+                appliedPitch = pct
+            except Exception:
+                # Don't let pitch failures break speech.
+                pass
+        # Start from the user's configured pitch.
+        applyPitchPercent(basePitch)
         for (text, indexesAfter) in blocks:
             if not self.speaking: break
             if text:
@@ -501,8 +543,13 @@ class SynthDriver(SynthDriver):
                     if not self.speaking: break
                     seg = seg.strip()
                     if not seg: continue
+                    desiredPitch = basePitch
+                    if capDelta and len(seg) == 1 and ('A' <= seg <= 'Z'):
+                        desiredPitch = basePitch + capDelta
+                    applyPitchPercent(desiredPitch)
                     self._dll.sv_startSpeakW(self._handle, seg)
                     if not self._pumpUntilDone(): self.speaking = False; break
+                    applyPitchPercent(basePitch)
             if self.speaking:
                 def cb(idxs=indexesAfter):
                     if self.speaking:
@@ -520,6 +567,10 @@ class SynthDriver(SynthDriver):
         if not s: return ""
         if self._pauseFactorPercent < 50:
             s = _labelColonRe.sub(r"\1 \2", s); s = _labelSemiRe.sub(r"\1 \2", s)
+        # Optional acronym handling: if disabled, spell short ALL-CAPS words (2-5 letters).
+        if (not bool(getattr(self, "_useAbbreviations", True))) and str(getattr(self, "_smode", "0")) != "2":
+            s = _applyAcronymSpacing(s)
+
         # Optional number expansion (helps when SoftVoice spells long digit runs).
         try: numMode = int(getattr(self, "_numproc", "0") or 0)
         except Exception: numMode = 0
@@ -623,6 +674,22 @@ class SynthDriver(SynthDriver):
         if self._handle: getattr(self._dll, func_name)(self._handle, val)
 
     def _get_availableNumprocs(self): return numprocs
+    def _get_useAbbreviations(self):
+        # When enabled, we let SoftVoice handle abbreviations/acronyms normally.
+        # When disabled, we insert spaces into short ALL-CAPS words (e.g. NVDA -> N V D A)
+        # to prevent unwanted expansions like "Nevada access".
+        return bool(getattr(self, "_useAbbreviations", True))
+
+    def _set_useAbbreviations(self, v):
+        if isinstance(v, str):
+            vv = v.strip().lower()
+            self._useAbbreviations = vv in ("1", "true", "yes", "on")
+            return
+        try:
+            self._useAbbreviations = bool(int(v))
+        except Exception:
+            self._useAbbreviations = bool(v)
+
     def _get_numproc(self): return getattr(self, "_numproc", "0")
     def _set_numproc(self, v): self._numproc = str(v)
 
