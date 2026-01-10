@@ -1128,16 +1128,24 @@ static void workerLoop(SV_STATE* s, int initialVoice) {
             continue;
         }
 
-        // Tail-grace: wait until no new audio for ~30ms (max 250ms)
-        ULONGLONG graceStart = GetTickCount64();
-        while (true) {
-            ULONGLONG last = s->lastAudioTick.load(std::memory_order_relaxed);
-            ULONGLONG now = GetTickCount64();
+        bool skipGrace = false;
+        {
+            std::lock_guard<std::mutex> lk(s->cmdMtx);
+            skipGrace = !s->cmdQ.empty();
+        }
 
-            if (last != 0 && (now - last) >= 30) break;
-            if ((now - graceStart) >= 250) break;
+        if (!skipGrace) {
+            // Tail-grace: wait until no new audio for ~30ms (max 250ms)
+            ULONGLONG graceStart = GetTickCount64();
+            while (true) {
+                ULONGLONG last = s->lastAudioTick.load(std::memory_order_relaxed);
+                ULONGLONG now = GetTickCount64();
 
-            if (WaitForSingleObject(s->stopEvent, 5) == WAIT_OBJECT_0) break;
+                if (last != 0 && (now - last) >= 30) break;
+                if ((now - graceStart) >= 250) break;
+
+                if (WaitForSingleObject(s->stopEvent, 5) == WAIT_OBJECT_0) break;
+            }
         }
 
         // gate off before DONE
