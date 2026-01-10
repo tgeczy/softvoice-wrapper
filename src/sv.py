@@ -76,6 +76,87 @@ _labelColonRe = re.compile(r"([A-Za-z]{2,})\s*:\s*([A-Za-z])")
 _labelSemiRe = re.compile(r"([A-Za-z]{2,})\s*;\s*([A-Za-z])")
 _spellWordRe = re.compile(r"[A-Za-z0-9]+")
 
+# --- Number processing (optional) ---
+# SoftVoice sometimes spells long digit runs. We can pre-expand numbers into words before handing text to the engine.
+_numberTokenRe = re.compile(r"\b\d{1,3}(?:,\d{3})+\b|\b\d+\b")
+_validCommaNumberRe = re.compile(r"^\d{1,3}(?:,\d{3})+$")
+
+_EN_ONES = (
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
+)
+_EN_TENS = ("", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety")
+_EN_SCALES = (
+    (10**18, "quintillion"),
+    (10**15, "quadrillion"),
+    (10**12, "trillion"),
+    (10**9, "billion"),
+    (10**6, "million"),
+    (10**3, "thousand"),
+    (1, ""),
+)
+
+def _enUnder1000(n: int) -> str:
+    n = int(n)
+    if n <= 0:
+        return "zero"
+    parts = []
+    if n >= 100:
+        parts.append(_EN_ONES[n // 100])
+        parts.append("hundred")
+        n = n % 100
+    if n >= 20:
+        parts.append(_EN_TENS[n // 10])
+        n = n % 10
+        if n:
+            parts.append(_EN_ONES[n])
+    elif n > 0:
+        parts.append(_EN_ONES[n])
+    return " ".join(parts)
+
+def _intToWordsEn(n: int) -> str:
+    n = int(n)
+    if n == 0:
+        return "zero"
+    if n < 0:
+        return "minus " + _intToWordsEn(-n)
+    parts = []
+    for scale, name in _EN_SCALES:
+        if n < scale:
+            continue
+        chunk = n // scale
+        n = n % scale
+        if chunk:
+            parts.append(_enUnder1000(chunk))
+            if name:
+                parts.append(name)
+    return " ".join(parts).strip()
+
+def _applyNumberProcessingEnglish(text: str, mode: int) -> str:
+    if not text or mode <= 0:
+        return text
+
+    def repl(m: "re.Match[str]") -> str:
+        tok = m.group(0)
+        if "," in tok and not _validCommaNumberRe.match(tok):
+            return tok
+        digits = tok.replace(",", "")
+        # Keep things that look like IDs (leading zeros).
+        if len(digits) > 1 and digits.startswith("0"):
+            return tok
+        try:
+            n = int(digits)
+        except Exception:
+            return tok
+        if mode == 1 and n < 10000:
+            return tok
+        # Avoid massive output for extremely large numbers.
+        if n >= 10**21:
+            return tok
+        return _intToWordsEn(n)
+
+    return _numberTokenRe.sub(repl, text)
+
 def _sanitizeText(s: str) -> str:
     if not s: return ""
     s = s.translate(_PUNCT_TRANSLATE)
@@ -128,6 +209,13 @@ smodes = OrderedDict()
 def _k(_id, label): smodes[str(_id)] = VoiceInfo(str(_id), label)
 _k(0, "Natural"); _k(1, "Word-at-a-time"); _k(2, "Spelled")
 
+numprocs = OrderedDict()
+def _np(_id, label): numprocs[str(_id)] = VoiceInfo(str(_id), label)
+_np(0, "Off")
+_np(1, "Large numbers (>= 10000)")
+_np(2, "All numbers")
+
+
 class SynthDriver(SynthDriver):
     name = "sv"
     description = "SoftVoice (nvwave)"
@@ -145,6 +233,7 @@ class SynthDriver(SynthDriver):
         DriverSetting("gender", "Gender"),
         DriverSetting("glot", "Glottal Source"),
         DriverSetting("smode", "Speaking Mode"),
+        DriverSetting("numproc", "Number processing"),
         NumericDriverSetting("pauseFactor", "Pause factor"),
     )
     supportedCommands = {IndexCommand}
@@ -201,6 +290,7 @@ class SynthDriver(SynthDriver):
         self._gender = "0"
         self._glot = "0"
         self._smode = "0"
+        self._numproc = "0"
         self.curvoice = "1"
 
         self._paramExplicit = {
@@ -430,6 +520,12 @@ class SynthDriver(SynthDriver):
         if not s: return ""
         if self._pauseFactorPercent < 50:
             s = _labelColonRe.sub(r"\1 \2", s); s = _labelSemiRe.sub(r"\1 \2", s)
+        # Optional number expansion (helps when SoftVoice spells long digit runs).
+        try: numMode = int(getattr(self, "_numproc", "0") or 0)
+        except Exception: numMode = 0
+        if numMode and str(getattr(self, "curvoice", "1")) == "1" and str(getattr(self, "_smode", "0")) != "2":
+            s = _applyNumberProcessingEnglish(s, numMode)
+
         if str(getattr(self, "_smode", "0")) == "2":
             def _spellMatch(m): return " ".join(list(m.group(0)))
             s = _spellWordRe.sub(_spellMatch, s)
@@ -525,6 +621,10 @@ class SynthDriver(SynthDriver):
                 return
         self._paramExplicit[key] = True
         if self._handle: getattr(self._dll, func_name)(self._handle, val)
+
+    def _get_availableNumprocs(self): return numprocs
+    def _get_numproc(self): return getattr(self, "_numproc", "0")
+    def _set_numproc(self, v): self._numproc = str(v)
 
     def _get_availableIntstyles(self): return intstyles
     def _get_intstyle(self): return getattr(self, "_intstyle", "0")

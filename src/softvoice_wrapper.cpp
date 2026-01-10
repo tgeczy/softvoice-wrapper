@@ -823,20 +823,54 @@ static bool applyPersonalityOnWorker(SV_STATE* s, bool forceIfUserSet) {
 
 // ------------------------------------------------------------
 // Silence trimming (conservative) — applied at read-time under outMtx.
-// Only supports PCM 16-bit for now.
+// Supports PCM 8-bit unsigned and PCM 16-bit signed.
 // ------------------------------------------------------------
 static inline uint32_t abs16(int16_t v) {
     return (v < 0) ? (uint32_t)(-(int32_t)v) : (uint32_t)v;
 }
 
-static size_t computeLeadingTrimBytesLocked(const SV_STATE* s, const StreamItem& it, uint64_t bytesPerSec, int maxTrimMs, int keepMs, uint32_t threshold) {
+static inline uint32_t abs8u(uint8_t v) {
+    // 8-bit PCM is unsigned (silence is ~128).
+    const int dv = (int)v - 128;
+    return (dv < 0) ? (uint32_t)(-dv) : (uint32_t)dv;
+}
+
+static inline uint32_t thresholdFor8Bit(uint32_t threshold16) {
+    // threshold16 is tuned for 16-bit amplitudes. Map to 8-bit amplitude space (0..127).
+    // Dividing by ~64 yields a practical range (~1..3) for typical SoftVoice output.
+    uint32_t t = threshold16 / 64u;
+    if (t < 1u) t = 1u;
+    if (t > 127u) t = 127u;
+    return t;
+}
+
+static bool isSilentFramePCM16(const uint8_t* frameBytes, int ch, uint32_t threshold16) {
+    const int16_t* frame = reinterpret_cast<const int16_t*>(frameBytes);
+    for (int c = 0; c < ch; ++c) {
+        if (abs16(frame[c]) > threshold16) return false;
+    }
+    return true;
+}
+
+static bool isSilentFramePCM8(const uint8_t* frameBytes, int ch, uint32_t threshold8) {
+    for (int c = 0; c < ch; ++c) {
+        if (abs8u(frameBytes[c]) > threshold8) return false;
+    }
+    return true;
+}
+
+static size_t computeLeadingTrimBytesLocked(const SV_STATE* s, const StreamItem& it, uint64_t bytesPerSec, int maxTrimMs, int keepMs, uint32_t threshold16) {
     if (!s || !s->formatValid) return 0;
     if (!s->lastFormat.nBlockAlign || !s->lastFormat.nChannels) return 0;
     if (s->lastFormat.wFormatTag != WAVE_FORMAT_PCM) return 0;
-    if (s->lastFormat.wBitsPerSample != 16) return 0;
 
+    const WORD bits = s->lastFormat.wBitsPerSample;
+    if (bits != 8 && bits != 16) return 0;
+
+    const size_t bytesPerSample = (bits == 8) ? 1 : 2;
+    const size_t minAlign = (size_t)s->lastFormat.nChannels * bytesPerSample;
     const size_t blockAlign = (size_t)s->lastFormat.nBlockAlign;
-    if (blockAlign < (size_t)s->lastFormat.nChannels * 2) return 0;
+    if (blockAlign < minAlign) return 0;
 
     if (it.offset != 0) return 0; // only before any reads
 
@@ -856,17 +890,14 @@ static size_t computeLeadingTrimBytesLocked(const SV_STATE* s, const StreamItem&
 
     const int ch = (int)s->lastFormat.nChannels;
     const uint8_t* base = it.data.data();
+    const uint32_t threshold8 = (bits == 8) ? thresholdFor8Bit(threshold16) : 0;
 
     size_t i = 0;
     for (; i < scanFrames; ++i) {
-        const int16_t* frame = reinterpret_cast<const int16_t*>(base + i * blockAlign);
-        bool silent = true;
-        for (int c = 0; c < ch; ++c) {
-            if (abs16(frame[c]) > threshold) {
-                silent = false;
-                break;
-            }
-        }
+        const uint8_t* frameBytes = base + i * blockAlign;
+        const bool silent = (bits == 16)
+            ? isSilentFramePCM16(frameBytes, ch, threshold16)
+            : isSilentFramePCM8(frameBytes, ch, threshold8);
         if (!silent) break;
     }
 
@@ -875,53 +906,79 @@ static size_t computeLeadingTrimBytesLocked(const SV_STATE* s, const StreamItem&
     return trimFrames * blockAlign;
 }
 
-static size_t computeTrailingTrimBytesLocked(const SV_STATE* s, const StreamItem& it, uint64_t bytesPerSec, int maxTrimMs, int keepMs, uint32_t threshold) {
+static size_t computeTrailingTrimBytesLocked(const SV_STATE* s, const StreamItem& it, uint64_t bytesPerSec, int maxTrimMs, int keepMs, uint32_t threshold16) {
     if (!s || !s->formatValid) return 0;
     if (!s->lastFormat.nBlockAlign || !s->lastFormat.nChannels) return 0;
     if (s->lastFormat.wFormatTag != WAVE_FORMAT_PCM) return 0;
-    if (s->lastFormat.wBitsPerSample != 16) return 0;
 
+    const WORD bits = s->lastFormat.wBitsPerSample;
+    if (bits != 8 && bits != 16) return 0;
+
+    const size_t bytesPerSample = (bits == 8) ? 1 : 2;
+    const size_t minAlign = (size_t)s->lastFormat.nChannels * bytesPerSample;
     const size_t blockAlign = (size_t)s->lastFormat.nBlockAlign;
-    if (blockAlign < (size_t)s->lastFormat.nChannels * 2) return 0;
+    if (blockAlign < minAlign) return 0;
 
-    if (it.offset != 0) return 0; // only if not started reading
+    const size_t dataSz = it.data.size();
+    if (dataSz < blockAlign) return 0;
 
-    const size_t totalFrames = it.data.size() / blockAlign;
-    if (totalFrames == 0) return 0;
+    // Only trim bytes we have not already handed out.
+    const size_t off = it.offset;
+    if (off >= dataSz) return 0;
+
+    // Align scan boundaries to whole frames for analysis.
+    const size_t scanEnd = (dataSz / blockAlign) * blockAlign;
+    if (scanEnd == 0 || off >= scanEnd) return 0;
+
+    // Start scanning after the bytes we've already delivered, rounded up to the next full frame.
+    const size_t scanStart = ((off + blockAlign - 1) / blockAlign) * blockAlign;
+    if (scanStart >= scanEnd) return 0;
+
+    const size_t totalFrames = scanEnd / blockAlign;
+    const size_t startFrame = scanStart / blockAlign;
+    const size_t availableFrames = (totalFrames > startFrame) ? (totalFrames - startFrame) : 0;
+    if (availableFrames == 0) return 0;
 
     const size_t maxFrames = (bytesPerSec && maxTrimMs > 0)
         ? (size_t)((bytesPerSec * (uint64_t)maxTrimMs / 1000ULL) / (uint64_t)blockAlign)
-        : totalFrames;
+        : availableFrames;
 
     const size_t keepFrames = (bytesPerSec && keepMs > 0)
         ? (size_t)((bytesPerSec * (uint64_t)keepMs / 1000ULL) / (uint64_t)blockAlign)
         : 0;
 
-    size_t scanFrames = (maxFrames < totalFrames) ? maxFrames : totalFrames;
+    size_t scanFrames = (maxFrames < availableFrames) ? maxFrames : availableFrames;
     if (scanFrames == 0) return 0;
 
     const int ch = (int)s->lastFormat.nChannels;
     const uint8_t* base = it.data.data();
+    const uint32_t threshold8 = (bits == 8) ? thresholdFor8Bit(threshold16) : 0;
 
-    // scan backwards
+    // Scan backwards over the unread portion only.
     size_t trailing = 0;
     for (size_t j = 0; j < scanFrames; ++j) {
         const size_t idx = totalFrames - 1 - j;
-        const int16_t* frame = reinterpret_cast<const int16_t*>(base + idx * blockAlign);
-        bool silent = true;
-        for (int c = 0; c < ch; ++c) {
-            if (abs16(frame[c]) > threshold) {
-                silent = false;
-                break;
-            }
-        }
+        if (idx < startFrame) break; // safety
+        const uint8_t* frameBytes = base + idx * blockAlign;
+        const bool silent = (bits == 16)
+            ? isSilentFramePCM16(frameBytes, ch, threshold16)
+            : isSilentFramePCM8(frameBytes, ch, threshold8);
         if (!silent) break;
         ++trailing;
     }
 
     if (trailing <= keepFrames) return 0;
-    const size_t trimFrames = trailing - keepFrames;
-    return trimFrames * blockAlign;
+    size_t trimFrames = trailing - keepFrames;
+    size_t trimBytes = trimFrames * blockAlign;
+
+    // Never trim past scanStart, and never trim past the unread portion.
+    const size_t maxTrimBytes = scanEnd - scanStart;
+    if (trimBytes > maxTrimBytes) trimBytes = maxTrimBytes;
+
+    const size_t remaining = dataSz - off;
+    if (trimBytes > remaining) trimBytes = remaining;
+
+    return trimBytes;
 }
 
 // ------------------------------------------------------------
@@ -1567,15 +1624,24 @@ extern "C" SV_API int __cdecl sv_read(SV_STATE* s, int* outType, int* outValue, 
                 // Find the last audio item (unconsumed) and trim its tail.
                 for (auto rit = s->outQ.rbegin(); rit != s->outQ.rend(); ++rit) {
                     if (rit->type != SV_ITEM_AUDIO) continue;
-                    if (rit->offset != 0) break; // already being read; skip trimming for safety
+
+                    const size_t oldSz = rit->data.size();
+                    const size_t oldOff = rit->offset;
+
                     size_t trim = computeTrailingTrimBytesLocked(s, *rit, bps, maxTrimTailMs, keepTailMs, threshold);
-                    if (trim > 0 && trim < rit->data.size()) {
-                        const size_t oldSz = rit->data.size();
-                        const size_t newSz = oldSz - trim;
-                        rit->data.resize(newSz);
-                        // Update queued bytes: we removed trim bytes that would have been delivered.
-                        if (s->queuedAudioBytes >= trim) s->queuedAudioBytes -= trim;
-                        else s->queuedAudioBytes = 0;
+                    if (trim > 0 && oldSz > oldOff) {
+                        const size_t remaining = oldSz - oldOff;
+                        if (trim > remaining) trim = remaining;
+
+                        if (trim > 0) {
+                            const size_t newSz = oldSz - trim;
+                            if (newSz >= oldOff) {
+                                rit->data.resize(newSz);
+                                // Update queued bytes: we removed trim bytes that would have been delivered.
+                                if (s->queuedAudioBytes >= trim) s->queuedAudioBytes -= trim;
+                                else s->queuedAudioBytes = 0;
+                            }
+                        }
                     }
                     break;
                 }
