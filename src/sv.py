@@ -209,6 +209,7 @@ class SynthDriver(SynthDriver):
             "vfactor": False, "avbias": False, "afbias": False, "ahbias": False
         }
 
+        self._initializing = True
         self.rate = self._ratePercent
         self.pitch = 4
         self.inflection = 25
@@ -219,6 +220,7 @@ class SynthDriver(SynthDriver):
         self.ahbias = self._ahbiasPercent
         self.voice = self.curvoice
         self.pauseFactor = self._pauseFactorPercent
+        self._initializing = False
 
     def _acquireWrapper(self):
         global _wrapperHandle, _wrapperRefCount, _wrapperDll, _wrapperLock
@@ -442,6 +444,9 @@ class SynthDriver(SynthDriver):
         self._clampPercent(val)
         current = getattr(self, f"_{name}Percent")
         new_val = int(val)
+        if getattr(self, "_initializing", False):
+            setattr(self, f"_{name}Percent", new_val)
+            return
         if self._variant != "0" and not self._paramExplicit[name]:
              setattr(self, f"_{name}Percent", new_val)
              if new_val != current:
@@ -496,8 +501,6 @@ class SynthDriver(SynthDriver):
     def _get_variant(self): return getattr(self, "_variant", "0")
     def _set_variant(self, _id):
         new_v = str(_id)
-        if new_v != self._variant:
-            for k in self._paramExplicit: self._paramExplicit[k] = False
         self._variant = new_v
         if self._handle: self._dll.sv_setPersonality(self._handle, int(_id))
 
