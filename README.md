@@ -49,6 +49,21 @@ binaries.
 * The project links against MinHook (included under `src/minhook`).
 * Build with CMake using the included `CMakeLists.txt`.
 
+## `softvoice-say` sample app
+
+The repository now includes a small standalone Windows dialog app at
+`src/softvoice-say.cpp`. It is a lightweight "Speak Window" that exercises the
+wrapper DLL: enter or load text, tweak the same voice parameters exposed by the
+NVDA driver, and either speak immediately or save the output to a 11025 Hz,
+16-bit, mono WAV file. The source expects the dialog resource in
+`src/softvoice-say.rc` (and `resource.h`).
+
+Build notes:
+
+* Build x86 (SoftVoice is 32-bit).
+* Place `softvoice_wrapper.dll` and `tibase32.dll` (plus any SoftVoice language
+  DLLs) next to the built EXE.
+
 ## Thanks
 
 Huge thanks for checking this project out and for helping keep classic TTS engines accessible.
