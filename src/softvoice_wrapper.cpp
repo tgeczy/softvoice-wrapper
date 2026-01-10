@@ -777,6 +777,17 @@ static void applyNumericSettingsOnWorker(SV_STATE* s, bool force) {
     apply(s->ahBias, s->svSetAHBias);
 }
 
+static void discardTimbreDirtyOnWorker(SV_STATE* s) {
+    if (!s) return;
+    s->pitch.dirty.store(0, std::memory_order_relaxed);
+    s->f0Range.dirty.store(0, std::memory_order_relaxed);
+    s->f0Perturb.dirty.store(0, std::memory_order_relaxed);
+    s->vowelFactor.dirty.store(0, std::memory_order_relaxed);
+    s->avBias.dirty.store(0, std::memory_order_relaxed);
+    s->afBias.dirty.store(0, std::memory_order_relaxed);
+    s->ahBias.dirty.store(0, std::memory_order_relaxed);
+}
+
 static void applyStyleSettingOnWorker(SV_STATE* s, SettingInt& st, SVSet2IntFunc fn, bool forceIfUserSet) {
     if (!s || s->svHandle == 0) return;
     if (!fn) return;
@@ -1044,6 +1055,10 @@ static void workerLoop(SV_STATE* s, int initialVoice) {
         const int persVal = s->personality.value.load(std::memory_order_relaxed);
         const bool persUserSet = (s->personality.userSet.load(std::memory_order_relaxed) != 0);
         const bool persNonZero = persUserSet && (persVal != 0);
+
+        if (personalityApplied && persVal != 0) {
+            discardTimbreDirtyOnWorker(s);
+        }
 
         const bool forceNumeric = ((voiceChanged && !persNonZero) || (personalityApplied && persVal == 0));
 
