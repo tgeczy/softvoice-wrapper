@@ -55,7 +55,7 @@ static constexpr int SV_ITEM_AUDIO = 1;
 static constexpr int SV_ITEM_DONE  = 2;
 static constexpr int SV_ITEM_ERROR = 3;
 
-static constexpr int MAX_STRING_LENGTH = 1200;
+static constexpr size_t MAX_SOFTVOICE_CHUNK = 200;
 static constexpr int TARGET_WAV_RATE = 11025;
 static constexpr int TARGET_WAV_CHANNELS = 1;
 static constexpr int TARGET_WAV_BITS = 16;
@@ -223,9 +223,43 @@ static std::vector<std::wstring> SplitForSoftVoice(const std::wstring& text, int
         return out;
     }
 
-    // Normal modes: chunk into ~1200 UTF-16 code units.
-    for (size_t pos = 0; pos < t.size(); pos += MAX_STRING_LENGTH) {
-        out.push_back(t.substr(pos, MAX_STRING_LENGTH));
+    // Normal modes: chunk into small pieces at word boundaries.
+    std::wstring current;
+    current.reserve(MAX_SOFTVOICE_CHUNK);
+
+    size_t i = 0;
+    while (i < t.size()) {
+        while (i < t.size() && t[i] == L' ') i++;
+        if (i >= t.size()) break;
+        size_t j = i;
+        while (j < t.size() && t[j] != L' ') j++;
+        std::wstring word = t.substr(i, j - i);
+
+        if (word.size() > MAX_SOFTVOICE_CHUNK) {
+            if (!current.empty()) {
+                out.push_back(std::move(current));
+                current.clear();
+            }
+            for (size_t pos = 0; pos < word.size(); pos += MAX_SOFTVOICE_CHUNK) {
+                out.push_back(word.substr(pos, MAX_SOFTVOICE_CHUNK));
+            }
+            i = j;
+            continue;
+        }
+
+        if (current.empty()) {
+            current = std::move(word);
+        } else if (current.size() + 1 + word.size() <= MAX_SOFTVOICE_CHUNK) {
+            current.push_back(L' ');
+            current.append(word);
+        } else {
+            out.push_back(std::move(current));
+            current = std::move(word);
+        }
+        i = j;
+    }
+    if (!current.empty()) {
+        out.push_back(std::move(current));
     }
     return out;
 }
