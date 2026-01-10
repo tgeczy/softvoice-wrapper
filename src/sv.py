@@ -511,11 +511,13 @@ class SynthDriver(SynthDriver):
         val = int(val_id)
         current = int(getattr(self, attr_name, 0))
         setattr(self, attr_name, str(val_id))
-        if self._variant != "0" and not self._paramExplicit.get(key, False):
-            if val != current:
+        if not self._paramExplicit.get(key, False):
+            if self._variant == "0" and val == current:
+                return
+            if self._variant != "0":
                 self._paramExplicit[key] = True
                 if self._handle: getattr(self._dll, func_name)(self._handle, val)
-            return
+                return
         self._paramExplicit[key] = True
         if self._handle: getattr(self._dll, func_name)(self._handle, val)
 
