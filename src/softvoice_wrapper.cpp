@@ -10,8 +10,8 @@
 //   * Personality (variant) is treated like a preset: apply it first, then re-apply user numeric params.
 //   * Optional "style" params (voicing mode, glottal source, etc.) are only applied if explicitly set,
 //     so personalities like Robot/Martian can keep their internal presets.
-// - Improved pacing for "word-at-a-time": the waveOutWrite hook simulates playback time using a
-//   virtual timeline capped at maxLeadMs, independent of how fast the Python side drains sv_read.
+// - Sprint-and-wait buffering: the waveOutWrite hook allows SoftVoice to sprint until the queue
+//   fills, then waits in chunk-sized increments to apply backpressure.
 // - Optional conservative silence trimming to reduce chunk-boundary pauses.
 //
 // NOTE: SoftVoice is 32-bit (tibase32.dll etc). Build this wrapper as 32-bit.
@@ -235,15 +235,10 @@ struct SV_STATE {
     std::atomic<uint64_t> bytesPerSec{ 0 };
     std::atomic<ULONGLONG> lastAudioTick{ 0 };
 
-    // Allow SoftVoice to synthesize ahead of "virtual playback" by this amount (ms).
-    // This is enforced in hook_waveOutWrite.
+    // Legacy: allow SoftVoice to synthesize ahead of a virtual playback clock.
+    // Kept for compatibility with older builds, but currently unused.
     std::atomic<int> maxLeadMs{ 2000 };
     std::atomic<int> autoLead{ 1 }; // if 1, wrapper will tweak maxLeadMs when speaking mode changes
-
-    // Virtual playback timeline for hook throttling
-    std::mutex throttleMtx;
-    uint32_t throttleGen = 0;
-    ULONGLONG throttleVirtualEndTick = 0;
 
     // Optional silence trim
     std::atomic<int> trimSilence{ 1 };
@@ -468,7 +463,9 @@ static std::string sanitizeForSoftVoiceCp1252(const wchar_t* in) {
     return collapsed;
 }
 
-static void enqueueAudioFromHook(SV_STATE* s, uint32_t gen, const void* data, size_t size) {
+static void enqueueAudioFromHook(SV_STATE* s, uint32_t gen, const void* data, size_t size, bool* outWasEmpty, bool* outWasFull) {
+    if (outWasEmpty) *outWasEmpty = false;
+    if (outWasFull) *outWasFull = false;
     if (!s || !data || size == 0) return;
 
     std::vector<uint8_t> copied(size);
@@ -482,6 +479,10 @@ static void enqueueAudioFromHook(SV_STATE* s, uint32_t gen, const void* data, si
     if (curGen == 0 || gen != curGen) return;
 
     const size_t limit = (s->maxBufferedBytes > 0) ? s->maxBufferedBytes : (size_t)(512 * 1024);
+    const bool wasEmpty = (s->queuedAudioBytes == 0);
+    const bool wasFull = (s->queuedAudioBytes >= limit);
+    if (outWasEmpty) *outWasEmpty = wasEmpty;
+    if (outWasFull) *outWasFull = wasFull;
 
     auto dropOneAudio = [&]() -> bool {
         for (auto it = s->outQ.begin(); it != s->outQ.end(); ++it) {
@@ -585,40 +586,24 @@ static MMRESULT WINAPI hook_waveOutWrite(HWAVEOUT hwo, LPWAVEHDR pwh, UINT cbwh)
     const uint32_t curGen = s->currentGen.load(std::memory_order_relaxed);
     const bool capturing = (gen != 0 && gen == curGen);
 
+    bool bufferWasEmpty = false;
+    bool bufferWasFull = false;
     if (capturing && pwh->lpData && pwh->dwBufferLength > 0) {
-        enqueueAudioFromHook(s, gen, pwh->lpData, (size_t)pwh->dwBufferLength);
+        enqueueAudioFromHook(s, gen, pwh->lpData, (size_t)pwh->dwBufferLength, &bufferWasEmpty, &bufferWasFull);
     }
 
-    // If we are not capturing (e.g. canceled), don't throttle; finish immediately.
+    // If we are not capturing (e.g. canceled), finish immediately.
     if (!capturing) {
         pwh->dwFlags |= WHDR_DONE;
         signalWaveOutMessage(s, WOM_DONE, pwh);
         return MMSYSERR_NOERROR;
     }
 
-    // Throttle based on a virtual playback timeline so pacing does not depend on how fast Python drains sv_read.
-    uint64_t bps = s->bytesPerSec.load(std::memory_order_relaxed);
-    if (bps == 0) bps = 22050;
-
-    const int maxLead = s->maxLeadMs.load(std::memory_order_relaxed);
-    ULONGLONG sleepMs = 0;
-
-    if (maxLead >= 0 && pwh->dwBufferLength > 0) {
+    if (!bufferWasEmpty && bufferWasFull && pwh->dwBufferLength > 0) {
+        uint64_t bps = s->bytesPerSec.load(std::memory_order_relaxed);
+        if (bps == 0) bps = 22050;
         const uint64_t durMs64 = (bps ? (uint64_t)pwh->dwBufferLength * 1000ULL / bps : 0ULL);
-        const ULONGLONG durMs = (durMs64 > 0xFFFFFFFFULL) ? 0xFFFFFFFFu : (ULONGLONG)durMs64;
-
-        const ULONGLONG now = GetTickCount64();
-        {
-            std::lock_guard<std::mutex> lk(s->throttleMtx);
-            if (s->throttleGen != curGen) {
-                s->throttleGen = curGen;
-                s->throttleVirtualEndTick = now;
-            }
-            ULONGLONG newEnd = s->throttleVirtualEndTick + durMs;
-            ULONGLONG allowedEnd = now + (ULONGLONG)((maxLead < 0) ? 0 : maxLead);
-            if (newEnd > allowedEnd) sleepMs = newEnd - allowedEnd;
-            s->throttleVirtualEndTick = newEnd;
-        }
+        ULONGLONG sleepMs = (durMs64 > 0xFFFFFFFFULL) ? 0xFFFFFFFFu : (ULONGLONG)durMs64;
 
         // Sleep in small chunks; wake immediately on stop/cancel.
         while (sleepMs > 0) {
@@ -1020,13 +1005,6 @@ static void workerLoop(SV_STATE* s, int initialVoice) {
 
         // Reset trim flags (they are per-gen; atomic holds last-done gen)
         // Nothing required here; comparisons in sv_read will handle.
-
-        // Reset throttle state for this gen so the first waveOutWrite starts at "now".
-        {
-            std::lock_guard<std::mutex> lk(s->throttleMtx);
-            s->throttleGen = gen;
-            s->throttleVirtualEndTick = GetTickCount64();
-        }
 
         // clear output
         {
@@ -1462,7 +1440,7 @@ extern "C" SV_API void __cdecl sv_stop(SV_STATE* s) {
         s->cmdQ.clear();
     }
 
-    // wake worker + hook throttles
+    // wake worker + hook waits
     SetEvent(s->stopEvent);
     SetEvent(s->doneEvent);
     if (s->startEvent) SetEvent(s->startEvent);
