@@ -492,6 +492,17 @@ class SynthDriver(SynthDriver):
             chunk = bytes(self._tailBuf); self._tailBuf = bytearray()
             self._player.feed(chunk, len(chunk))
 
+    def _waitForPlaybackDrain(self):
+        if not self._player:
+            return
+        done = threading.Event()
+        try:
+            self._player.feed(b"", 0, onDone=done.set)
+        except Exception:
+            return
+        while self.speaking and not done.wait(0.01):
+            continue
+
     def _pumpUntilDone(self):
         outType = ctypes.c_int(0); outValue = ctypes.c_int(0)
         playerReady = bool(self._player)
@@ -553,6 +564,8 @@ class SynthDriver(SynthDriver):
                         applyPitchPercent(desiredPitch)
                     self._dll.sv_startSpeakW(self._handle, seg)
                     if not self._pumpUntilDone(): self.speaking = False; break
+                    if self.speaking:
+                        self._waitForPlaybackDrain()
                     if applyUserPitch:
                         applyPitchPercent(basePitch)
             if self.speaking:
