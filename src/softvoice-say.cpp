@@ -708,6 +708,27 @@ struct AppState {
     bool lastAppliedValid = false;
 
     bool initializing = false; // suppress "touched" flags while building the dialog
+    
+    // Explicit-setting flags (session-only).
+    //
+    // SoftVoice personalities (especially the fun ones like Robotoid/Martian) come with their own
+    // internal timbre defaults. If we blindly push our UI defaults into the engine, we overwrite
+    // those and the personality sounds wrong (e.g. whispery instead of robotic).
+    //
+    // Rule here matches the NVDA driver strategy:
+    //   - Rate/Pitch are always applied.
+    //   - For Variant != 0, only apply timbre/style knobs if the user has explicitly changed them.
+    bool expInflection = false;
+    bool expPerturb    = false;
+    bool expVfactor    = false;
+    bool expAvbias     = false;
+    bool expAfbias     = false;
+    bool expAhbias     = false;
+
+    bool expIntstyle   = false;
+    bool expVmode      = false;
+    bool expGender     = false;
+    bool expGlot       = false;
 };
 
 static constexpr UINT WM_APP_STATUS = WM_APP + 1;
@@ -774,96 +795,104 @@ static bool ApplyWrapperSettings(AppState* st, const UiSettings& s, const std::w
     void* h = st->api.handle;
     (void)tibasePath;
 
-    // Check if we are switching personalities OR if this is the first run.
-    bool personalitySwitching = false;
-    if (!st->lastAppliedValid) {
-        personalitySwitching = true; // Force everything on first run
-    } else if (st->lastApplied.variant != s.variant) {
-        personalitySwitching = true; // User switched variant
-    }
+    const bool firstApply = !st->lastAppliedValid;
+    const bool voiceChanged = firstApply || (st->lastApplied.voice != s.voice);
+    const bool variantChanged = firstApply || (st->lastApplied.variant != s.variant);
+    const bool presetChanged = voiceChanged || variantChanged;
 
-    // Helper: Returns true if the setting changed OR if we need to force re-send
-    auto changedOrForced = [&](auto getter) -> bool {
-        if (personalitySwitching) return true;
+    auto changed = [&](auto getter) -> bool {
+        if (firstApply) return true;
         return getter(st->lastApplied) != getter(s);
     };
+    auto changedOrPreset = [&](auto getter) -> bool {
+        if (presetChanged) return true;
+        return changed(getter);
+    };
 
-    // 1. Voice (Language)
-    if (st->api.sv_setVoice && changedOrForced([](const UiSettings& x) { return x.voice; })) {
+    // 1) Voice (language)
+    if (st->api.sv_setVoice && changed([](const UiSettings& x) { return x.voice; })) {
         st->api.sv_setVoice(h, s.voice);
     }
 
-    // 2. Personality (Variant)
-    if (st->api.sv_setPersonality && changedOrForced([](const UiSettings& x) { return x.variant; })) {
-        // [FIX] WAKE-UP TOGGLE + MALE FIX
-        // If requesting Variant 0 (Male), force a brief switch to Female (1) 
-        // to wake up the engine if it's stuck.
-        if (s.variant == 0 && personalitySwitching) {
-            st->api.sv_setPersonality(h, 1); 
+    // 2) Personality (variant)
+    //
+    // IMPORTANT: keep the "wake-up" behavior for Variant 0 (Male) from the known-good build.
+    // Some SoftVoice installs won't actually synthesize Male unless we poke the personality state.
+    if (st->api.sv_setPersonality && variantChanged) {
+        if (s.variant == 0) {
+            // Wake-up toggle: 0 -> 1 -> 0.
+            st->api.sv_setPersonality(h, 1);
             Sleep(20);
         }
         st->api.sv_setPersonality(h, s.variant);
     }
 
-    // 3. Speaking Mode (Force once on startup)
-    if (!st->lastAppliedValid && st->api.sv_setSpeakingMode) {
+    // 3) Speaking mode
+    //
+    // We implement word/spell modes in our own text splitter. Keep the engine in "Natural".
+    if (firstApply && st->api.sv_setSpeakingMode) {
         st->api.sv_setSpeakingMode(h, 0);
     }
 
-    // 4. PARAMETERS
-    // CRITICAL FIX: The "Male" voice (Variant 0) crashes/mutes if you send 
-    // Timbre parameters (Inflection, Gender, Biases) that override its internal defaults.
-    // NVDA avoids this by only sending params if the user moved a slider. 
-    // We will simply BLOCK these params for Male.
-
-    bool isMale = (s.variant == 0);
-
-    // Rate & Pitch are always safe/required.
-    if (st->api.sv_setRate && changedOrForced([](const UiSettings& x) { return x.ratePct; })) {
+    // 4) Always-safe knobs: Rate + Pitch
+    //
+    // Personality switches can reset internals, so we re-assert these after a preset change.
+    if (st->api.sv_setRate && changedOrPreset([](const UiSettings& x) { return x.ratePct; })) {
         st->api.sv_setRate(h, PercentToParam(s.ratePct, 20, 500));
     }
-    if (st->api.sv_setPitch && changedOrForced([](const UiSettings& x) { return x.pitchPct; })) {
+    if (st->api.sv_setPitch && changedOrPreset([](const UiSettings& x) { return x.pitchPct; })) {
         st->api.sv_setPitch(h, PercentToParam(s.pitchPct, 10, 2000));
     }
 
-    // The Danger Zone: Only send these if NOT Male.
+    const bool isMale = (s.variant == 0);
+
+    // 5) Timbre + style knobs
+    //
+    // The important trick for the fun personalities (Robotoid/Martian/etc):
+    // they come with their own internal defaults for perturb/biases/voicing/etc.
+    // If we blindly push our UI defaults, we overwrite those and the voice sounds wrong.
+    //
+    // Strategy (mirrors the NVDA driver):
+    //   - For Male (variant 0): do NOT push these knobs by default (male is fragile).
+    //   - For other variants: only push a knob if the user explicitly touched it.
     if (!isMale) {
-        if (st->api.sv_setF0Range && changedOrForced([](const UiSettings& x) { return x.inflectionPct; })) {
+        if (st->expInflection && st->api.sv_setF0Range && changedOrPreset([](const UiSettings& x) { return x.inflectionPct; })) {
             st->api.sv_setF0Range(h, PercentToParam(s.inflectionPct, 0, 500));
         }
-        if (st->api.sv_setF0Perturb && changedOrForced([](const UiSettings& x) { return x.perturbPct; })) {
+        if (st->expPerturb && st->api.sv_setF0Perturb && changedOrPreset([](const UiSettings& x) { return x.perturbPct; })) {
             st->api.sv_setF0Perturb(h, PercentToParam(s.perturbPct, 0, 500));
         }
-        if (st->api.sv_setVowelFactor && changedOrForced([](const UiSettings& x) { return x.vfactorPct; })) {
+        if (st->expVfactor && st->api.sv_setVowelFactor && changedOrPreset([](const UiSettings& x) { return x.vfactorPct; })) {
             st->api.sv_setVowelFactor(h, PercentToParam(s.vfactorPct, 0, 500));
         }
-        if (st->api.sv_setAVBias && changedOrForced([](const UiSettings& x) { return x.avbiasPct; })) {
+
+        if (st->expAvbias && st->api.sv_setAVBias && changedOrPreset([](const UiSettings& x) { return x.avbiasPct; })) {
             st->api.sv_setAVBias(h, PercentToParam(s.avbiasPct, -50, 50));
         }
-        if (st->api.sv_setAFBias && changedOrForced([](const UiSettings& x) { return x.afbiasPct; })) {
+        if (st->expAfbias && st->api.sv_setAFBias && changedOrPreset([](const UiSettings& x) { return x.afbiasPct; })) {
             st->api.sv_setAFBias(h, PercentToParam(s.afbiasPct, -50, 50));
         }
-        if (st->api.sv_setAHBias && changedOrForced([](const UiSettings& x) { return x.ahbiasPct; })) {
+        if (st->expAhbias && st->api.sv_setAHBias && changedOrPreset([](const UiSettings& x) { return x.ahbiasPct; })) {
             st->api.sv_setAHBias(h, PercentToParam(s.ahbiasPct, -50, 50));
         }
 
-        // Enums
-        if (st->api.sv_setF0Style && changedOrForced([](const UiSettings& x) { return x.intstyle; })) {
+        // Enums (only if explicitly changed in the UI)
+        if (st->expIntstyle && st->api.sv_setF0Style && changedOrPreset([](const UiSettings& x) { return x.intstyle; })) {
             st->api.sv_setF0Style(h, s.intstyle);
         }
-        if (st->api.sv_setVoicingMode && changedOrForced([](const UiSettings& x) { return x.vmode; })) {
+        if (st->expVmode && st->api.sv_setVoicingMode && changedOrPreset([](const UiSettings& x) { return x.vmode; })) {
             st->api.sv_setVoicingMode(h, s.vmode);
         }
-        if (st->api.sv_setGender && changedOrForced([](const UiSettings& x) { return x.gender; })) {
+        if (st->expGender && st->api.sv_setGender && changedOrPreset([](const UiSettings& x) { return x.gender; })) {
             st->api.sv_setGender(h, s.gender);
         }
-        if (st->api.sv_setGlottalSource && changedOrForced([](const UiSettings& x) { return x.glot; })) {
+        if (st->expGlot && st->api.sv_setGlottalSource && changedOrPreset([](const UiSettings& x) { return x.glot; })) {
             st->api.sv_setGlottalSource(h, s.glot);
         }
     }
 
     // Wrapper-only knobs (safe)
-    if (st->api.sv_setPauseFactor && changedOrForced([](const UiSettings& x) { return x.pausePct; })) {
+    if (st->api.sv_setPauseFactor && changedOrPreset([](const UiSettings& x) { return x.pausePct; })) {
         st->api.sv_setPauseFactor(h, 100 - s.pausePct);
         if (st->api.sv_setTrimSilence) {
             st->api.sv_setTrimSilence(h, (s.pausePct < 50) ? 1 : 0);
@@ -1257,6 +1286,33 @@ static INT_PTR CALLBACK MainDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lP
         const int code = HIWORD(wParam);
 
         if (!st) return FALSE;
+
+        // Track which "timbre/style" knobs the user explicitly touched.
+        //
+        // For non-Male personalities, we avoid pushing our default knob values into the engine
+        // unless the user has changed them (otherwise we stomp the personality's own defaults).
+        if (!st->initializing) {
+            if (code == EN_CHANGE) {
+                switch (id) {
+                case IDC_INFLECTION: st->expInflection = true; break;
+                case IDC_PERTURB:    st->expPerturb    = true; break;
+                case IDC_VFACTOR:    st->expVfactor    = true; break;
+                case IDC_AVBIAS:     st->expAvbias     = true; break;
+                case IDC_AFBIAS:     st->expAfbias     = true; break;
+                case IDC_AHBIAS:     st->expAhbias     = true; break;
+                default: break;
+                }
+            } else if (code == CBN_SELCHANGE) {
+                switch (id) {
+                case IDC_INTSTYLE: st->expIntstyle = true; break;
+                case IDC_VMODE:    st->expVmode    = true; break;
+                case IDC_GENDER:   st->expGender   = true; break;
+                case IDC_GLOT:     st->expGlot     = true; break;
+                default: break;
+                }
+            }
+        }
+
 
         switch (id) {
         case IDC_ENGINE_BROWSE: {
