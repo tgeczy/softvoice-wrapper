@@ -1,0 +1,68 @@
+#include <windows.h>
+#include <commctrl.h>
+#include "resource.h"
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Dialog
+//
+/////////////////////////////////////////////////////////////////////////////
+
+IDD_SOFTVOICE_SAY DIALOGEX 0, 0, 380, 310
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "SoftVoice Speak"
+FONT 9, "Segoe UI"
+BEGIN
+    // Engine path
+    LTEXT           "&Engine DLL:",        -1,                8,   8,  70,  10
+    EDITTEXT        IDC_ENGINE_PATH,        80,  6, 240,  14, ES_AUTOHSCROLL | WS_TABSTOP
+    PUSHBUTTON      "&Browse...",           IDC_ENGINE_BROWSE, 325, 6,  45,  14, WS_TABSTOP
+
+    // Text input
+    LTEXT           "&Text to speak:",      -1,                8,  26, 120, 10
+    EDITTEXT        IDC_TEXT_INPUT,          8,  38, 362,  90,
+                    ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_TABSTOP
+
+    // Voice parameters (left column)
+    LTEXT           "&Rate:",               -1,                8, 135, 40, 10
+    EDITTEXT        IDC_RATE,                50, 133, 40,  14, ES_NUMBER | WS_TABSTOP
+    CONTROL         "", IDC_RATE_SPIN, "msctls_updown32",
+                    UDS_SETBUDDYINT | UDS_ALIGNRIGHT,
+                    90, 133, 12, 14
+
+    LTEXT           "&Pitch:",              -1,                8, 155, 40, 10
+    EDITTEXT        IDC_PITCH,               50, 153, 40,  14, ES_NUMBER | WS_TABSTOP
+    CONTROL         "", IDC_PITCH_SPIN, "msctls_updown32",
+                    UDS_SETBUDDYINT | UDS_ALIGNRIGHT,
+                    90, 153, 12, 14
+
+    LTEXT           "&Inflection:",         -1,                8, 175, 55, 10
+    EDITTEXT        IDC_INFLECTION,          65, 173, 40,  14, ES_NUMBER | WS_TABSTOP
+    CONTROL         "", IDC_INFLECTION_SPIN, "msctls_updown32",
+                    UDS_SETBUDDYINT | UDS_ALIGNRIGHT,
+                    105, 173, 12, 14
+
+    // Voice parameters (right column)
+    LTEXT           "&Pause factor:",       -1,              150, 135, 70, 10
+    EDITTEXT        IDC_PAUSE,              225, 133, 40,  14, ES_NUMBER | WS_TABSTOP
+    CONTROL         "", IDC_PAUSE_SPIN, "msctls_updown32",
+                    UDS_SETBUDDYINT | UDS_ALIGNRIGHT,
+                    265, 133, 12, 14
+
+    LTEXT           "&Variant:",            -1,              150, 155, 55, 10
+    COMBOBOX        IDC_VARIANT,            225, 153, 145, 80,
+                    CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    LTEXT           "Speaking &mode:",      -1,              150, 175, 85, 10
+    COMBOBOX        IDC_SPEAKING_MODE,      235, 173, 135, 80,
+                    CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    // Actions
+    PUSHBUTTON      "&Open text file...",   IDC_OPEN_FILE,     8,  205, 110,  16, WS_TABSTOP
+    PUSHBUTTON      "&Speak",               IDC_SPEAK,       130, 205,  70,  16, WS_TABSTOP
+    PUSHBUTTON      "S&top",                IDC_STOP,        210, 205,  70,  16, WS_TABSTOP
+    PUSHBUTTON      "Save &WAV...",         IDC_SAVE_WAV,    290, 205,  80,  16, WS_TABSTOP
+
+    // Close
+    DEFPUSHBUTTON   "Close",                IDCANCEL,        290, 285,  80,  16, WS_TABSTOP
+END
