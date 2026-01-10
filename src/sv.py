@@ -4,12 +4,12 @@
 # SoftVoice (late 90s) NVDA synth driver.
 #
 # FINAL FIXES:
-# 1. PAUSE FACTOR INVERTED: 
-#    - Slider 100 (User) -> DLL 0 (Engine) = Full Natural Pauses.
+# 1. PAUSE FACTOR INVERTED:
 #    - Slider 0 (User) -> DLL 100 (Engine) = Zero Pauses (Robot).
+#    - Slider 100 (User) -> DLL 0 (Engine) = Full Natural Pauses.
 #
 # 2. SECRET WEAPON (sv_setTrimSilence):
-#    - Automatically enables 'Trim Silence' when the slider is below 50.
+#    - Automatically enables 'Trim Silence' when the slider is below 50 (low pauses).
 #    - This forces the engine to cut startup latency for fast response.
 
 import os
@@ -424,7 +424,7 @@ class SynthDriver(SynthDriver):
     def _softVoiceSafeText(self, s: str) -> str:
         s = _sanitizeText(s)
         if not s: return ""
-        if self._pauseFactorPercent > 50:
+        if self._pauseFactorPercent < 50:
             s = _labelColonRe.sub(r"\1 \2", s); s = _labelSemiRe.sub(r"\1 \2", s)
         if str(getattr(self, "_smode", "0")) == "2":
             def _spellMatch(m): return " ".join(list(m.group(0)))
@@ -481,8 +481,8 @@ class SynthDriver(SynthDriver):
         if self._handle:
             if self._hasPauseFactor:
                 # INVERSION FIX:
-                # User 100 (Full) -> Engine 0 (Slow/Full).
                 # User 0 (None) -> Engine 100 (Fast/NoPause).
+                # User 100 (Full) -> Engine 0 (Slow/Full).
                 inverted = 100 - int(self._pauseFactorPercent)
                 try: self._dll.sv_setPauseFactor(self._handle, inverted)
                 except: pass
