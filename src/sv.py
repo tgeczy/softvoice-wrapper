@@ -299,15 +299,17 @@ class SynthDriver(SynthDriver):
     def _buildBlocks(self, speechSequence):
         blocks = []
         textBuf = []
-        def flush(indexesAfter):
+        pendingIndexes = []
+        def flush():
             raw = " ".join(textBuf)
             textBuf.clear()
             safe = self._softVoiceSafeText(raw)
-            blocks.append((safe, indexesAfter))
+            blocks.append((safe, pendingIndexes.copy()))
+            pendingIndexes.clear()
         for item in speechSequence:
             if isinstance(item, str): textBuf.append(item)
-            elif isinstance(item, IndexCommand): flush([item.index])
-        if textBuf: flush([])
+            elif isinstance(item, IndexCommand): pendingIndexes.append(item.index)
+        if textBuf or pendingIndexes: flush()
         while blocks and (not blocks[-1][0]) and (not blocks[-1][1]): blocks.pop()
         anyText = any(bool(t) for (t, _) in blocks)
         allIndexes = []
