@@ -308,7 +308,8 @@ class SynthDriver(SynthDriver):
         self._paramExplicit = {
             "intstyle": False, "vmode": False, "gender": False, "glot": False,
             "smode": False, "inflection": False, "perturb": False,
-            "vfactor": False, "avbias": False, "afbias": False, "ahbias": False
+            "vfactor": False, "avbias": False, "afbias": False, "ahbias": False,
+            "pitch": False
         }
 
         self._initializing = True
@@ -521,6 +522,7 @@ class SynthDriver(SynthDriver):
         is_word_mode = (str(self._smode) == "1")
         basePitch = int(getattr(self, "_pitchPercent", 50))
         capDelta = self._getCapPitchChangePercent()
+        applyUserPitch = (self._variant == "0" or self._paramExplicit.get("pitch", False))
         appliedPitch = None
         def applyPitchPercent(pct: int):
             nonlocal appliedPitch
@@ -533,8 +535,9 @@ class SynthDriver(SynthDriver):
             except Exception:
                 # Don't let pitch failures break speech.
                 pass
-        # Start from the user's configured pitch.
-        applyPitchPercent(basePitch)
+        if applyUserPitch:
+            # Start from the user's configured pitch.
+            applyPitchPercent(basePitch)
         for (text, indexesAfter) in blocks:
             if not self.speaking: break
             if text:
@@ -543,13 +546,15 @@ class SynthDriver(SynthDriver):
                     if not self.speaking: break
                     seg = seg.strip()
                     if not seg: continue
-                    desiredPitch = basePitch
-                    if capDelta and len(seg) == 1 and ('A' <= seg <= 'Z'):
-                        desiredPitch = basePitch + capDelta
-                    applyPitchPercent(desiredPitch)
+                    if applyUserPitch:
+                        desiredPitch = basePitch
+                        if capDelta and len(seg) == 1 and ('A' <= seg <= 'Z'):
+                            desiredPitch = basePitch + capDelta
+                        applyPitchPercent(desiredPitch)
                     self._dll.sv_startSpeakW(self._handle, seg)
                     if not self._pumpUntilDone(): self.speaking = False; break
-                    applyPitchPercent(basePitch)
+                    if applyUserPitch:
+                        applyPitchPercent(basePitch)
             if self.speaking:
                 def cb(idxs=indexesAfter):
                     if self.speaking:
@@ -614,6 +619,7 @@ class SynthDriver(SynthDriver):
     def _get_pitch(self): return int(self._pitchPercent)
     def _set_pitch(self, v):
         self._pitchPercent = self._clampPercent(v)
+        self._paramExplicit["pitch"] = True
         if self._handle: self._dll.sv_setPitch(self._handle, self._percentToParam(self._pitchPercent, 10, 2000))
 
     def _get_inflection(self): return int(self._inflectionPercent)
@@ -651,6 +657,7 @@ class SynthDriver(SynthDriver):
     def _set_variant(self, _id):
         new_v = str(_id)
         self._variant = new_v
+        self._paramExplicit["pitch"] = False
         if self._handle: self._dll.sv_setPersonality(self._handle, int(_id))
 
     def _get_voice(self): return getattr(self, "curvoice", "1")
