@@ -55,7 +55,9 @@ static constexpr int SV_ITEM_AUDIO = 1;
 static constexpr int SV_ITEM_DONE  = 2;
 static constexpr int SV_ITEM_ERROR = 3;
 
-static constexpr size_t MAX_SOFTVOICE_CHUNK = 200;
+// SoftVoice tends to misbehave a little above ~200 characters.
+// Keep a small safety margin so we don't end up right on the edge.
+static constexpr size_t MAX_SOFTVOICE_CHUNK = 190;
 static constexpr int TARGET_WAV_RATE = 11025;
 static constexpr int TARGET_WAV_CHANNELS = 1;
 static constexpr int TARGET_WAV_BITS = 16;
@@ -217,49 +219,67 @@ static std::vector<std::wstring> SplitForSoftVoice(const std::wstring& text, int
             size_t j = i;
             while (j < t.size() && t[j] != L' ') j++;
             std::wstring w = t.substr(i, j - i);
-            if (!w.empty()) out.push_back(std::move(w));
+            if (!w.empty()) {
+                if (w.size() <= MAX_SOFTVOICE_CHUNK) {
+                    out.push_back(std::move(w));
+                } else {
+                    // Extremely long "words" (e.g. URLs) still need to respect the engine limit.
+                    for (size_t pos = 0; pos < w.size(); pos += MAX_SOFTVOICE_CHUNK) {
+                        out.push_back(w.substr(pos, MAX_SOFTVOICE_CHUNK));
+                    }
+                }
+            }
             i = j;
         }
         return out;
     }
 
-    // Normal modes: chunk into small pieces at word boundaries.
-    std::wstring current;
-    current.reserve(MAX_SOFTVOICE_CHUNK);
+    // Normal modes: chunk into small pieces, *preferring* nice breakpoints.
+    // Priority (best -> worst): sentence end, clause break, space, hard split.
+    auto isSentenceEnd = [](wchar_t c) {
+        return (c == L'.' || c == L'!' || c == L'?');
+    };
+    auto isClauseEnd = [](wchar_t c) {
+        return (c == L',' || c == L';' || c == L':');
+    };
 
-    size_t i = 0;
-    while (i < t.size()) {
-        while (i < t.size() && t[i] == L' ') i++;
-        if (i >= t.size()) break;
-        size_t j = i;
-        while (j < t.size() && t[j] != L' ') j++;
-        std::wstring word = t.substr(i, j - i);
+    auto findBreak = [&](size_t start, size_t maxEndExclusive) -> size_t {
+        if (maxEndExclusive > t.size()) maxEndExclusive = t.size();
+        if (start >= maxEndExclusive) return maxEndExclusive;
 
-        if (word.size() > MAX_SOFTVOICE_CHUNK) {
-            if (!current.empty()) {
-                out.push_back(std::move(current));
-                current.clear();
+        auto scanBack = [&](auto pred) -> size_t {
+            for (size_t i = maxEndExclusive; i > start; --i) {
+                if (pred(t[i - 1])) {
+                    return i; // break AFTER this character
+                }
             }
-            for (size_t pos = 0; pos < word.size(); pos += MAX_SOFTVOICE_CHUNK) {
-                out.push_back(word.substr(pos, MAX_SOFTVOICE_CHUNK));
-            }
-            i = j;
-            continue;
+            return 0;
+        };
+
+        size_t end = scanBack(isSentenceEnd);
+        if (!end) end = scanBack(isClauseEnd);
+        if (!end) end = scanBack([](wchar_t c) { return c == L' '; });
+        if (!end) end = maxEndExclusive;
+        if (end <= start) end = maxEndExclusive;
+        return end;
+    };
+
+    size_t start = 0;
+    while (start < t.size()) {
+        while (start < t.size() && t[start] == L' ') start++;
+        if (start >= t.size()) break;
+
+        size_t maxEnd = start + MAX_SOFTVOICE_CHUNK;
+        if (maxEnd >= t.size()) {
+            std::wstring seg = Trim(t.substr(start));
+            if (!seg.empty()) out.push_back(std::move(seg));
+            break;
         }
 
-        if (current.empty()) {
-            current = std::move(word);
-        } else if (current.size() + 1 + word.size() <= MAX_SOFTVOICE_CHUNK) {
-            current.push_back(L' ');
-            current.append(word);
-        } else {
-            out.push_back(std::move(current));
-            current = std::move(word);
-        }
-        i = j;
-    }
-    if (!current.empty()) {
-        out.push_back(std::move(current));
+        size_t end = findBreak(start, maxEnd);
+        std::wstring seg = Trim(t.substr(start, end - start));
+        if (!seg.empty()) out.push_back(std::move(seg));
+        start = end;
     }
     return out;
 }
@@ -479,6 +499,9 @@ public:
     WaveOutPlayer() = default;
     ~WaveOutPlayer() { close(); }
 
+    bool isOpen() const { return _hwo != nullptr; }
+    long pendingBuffers() const { return _pending.load(); }
+
     bool open(int sampleRate, int channels, int bitsPerSample) {
         close();
         if (sampleRate <= 0 || channels <= 0) return false;
@@ -492,13 +515,24 @@ public:
         wfx.nBlockAlign = (WORD)(channels * (bitsPerSample / 8));
         wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
 
+        // drainedEvent: manual-reset, signaled when pending == 0.
         _drainedEvent = CreateEventW(nullptr, TRUE, TRUE, nullptr);
-        if (!_drainedEvent) return false;
+        // oneDoneEvent: auto-reset, signaled on every WOM_DONE (used for backpressure).
+        _oneDoneEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!_drainedEvent || !_oneDoneEvent) {
+            if (_drainedEvent) CloseHandle(_drainedEvent);
+            if (_oneDoneEvent) CloseHandle(_oneDoneEvent);
+            _drainedEvent = nullptr;
+            _oneDoneEvent = nullptr;
+            return false;
+        }
 
         MMRESULT mm = waveOutOpen(&_hwo, WAVE_MAPPER, &wfx, (DWORD_PTR)&WaveOutProc, (DWORD_PTR)this, CALLBACK_FUNCTION);
         if (mm != MMSYSERR_NOERROR) {
             CloseHandle(_drainedEvent);
+            CloseHandle(_oneDoneEvent);
             _drainedEvent = nullptr;
+            _oneDoneEvent = nullptr;
             _hwo = nullptr;
             return false;
         }
@@ -516,6 +550,10 @@ public:
         if (_drainedEvent) {
             CloseHandle(_drainedEvent);
             _drainedEvent = nullptr;
+        }
+        if (_oneDoneEvent) {
+            CloseHandle(_oneDoneEvent);
+            _oneDoneEvent = nullptr;
         }
     }
 
@@ -558,9 +596,16 @@ public:
         return true;
     }
 
-    void waitDrained(DWORD timeoutMs) {
-        if (!_drainedEvent) return;
-        WaitForSingleObject(_drainedEvent, timeoutMs);
+    bool waitDrained(DWORD timeoutMs) {
+        if (!_drainedEvent) return true;
+        DWORD r = WaitForSingleObject(_drainedEvent, timeoutMs);
+        return (r == WAIT_OBJECT_0);
+    }
+
+    bool waitOneDone(DWORD timeoutMs) {
+        if (!_oneDoneEvent) return true;
+        DWORD r = WaitForSingleObject(_oneDoneEvent, timeoutMs);
+        return (r == WAIT_OBJECT_0);
     }
 
 private:
@@ -582,6 +627,9 @@ private:
         }
 
         long left = self->_pending.fetch_sub(1) - 1;
+        if (self->_oneDoneEvent) {
+            SetEvent(self->_oneDoneEvent);
+        }
         if (left <= 0 && self->_drainedEvent) {
             SetEvent(self->_drainedEvent);
         }
@@ -590,6 +638,7 @@ private:
 
     HWAVEOUT _hwo = nullptr;
     HANDLE _drainedEvent = nullptr;
+    HANDLE _oneDoneEvent = nullptr;
     std::atomic<long> _pending{ 0 };
 };
 
@@ -735,6 +784,10 @@ struct AppState {
 
     std::atomic<bool> jobRunning{ false };
     std::atomic<bool> cancelRequested{ false };
+    std::atomic<bool> closing{ false };
+    
+    // Track currently loaded tibase path to detect changes
+    std::wstring loadedTibasePath;
 
     std::thread worker;
 
@@ -744,14 +797,6 @@ struct AppState {
     bool initializing = false; // suppress "touched" flags while building the dialog
     
     // Explicit-setting flags (session-only).
-    //
-    // SoftVoice personalities (especially the fun ones like Robotoid/Martian) come with their own
-    // internal timbre defaults. If we blindly push our UI defaults into the engine, we overwrite
-    // those and the personality sounds wrong (e.g. whispery instead of robotic).
-    //
-    // Rule here matches the NVDA driver strategy:
-    //   - Rate/Pitch are always applied.
-    //   - For Variant != 0, only apply timbre/style knobs if the user has explicitly changed them.
     bool expInflection = false;
     bool expPerturb    = false;
     bool expVfactor    = false;
@@ -843,34 +888,34 @@ static bool ApplyWrapperSettings(AppState* st, const UiSettings& s, const std::w
         return changed(getter);
     };
 
-    // 1) Voice (language)
     if (st->api.sv_setVoice && changed([](const UiSettings& x) { return x.voice; })) {
         st->api.sv_setVoice(h, s.voice);
     }
 
-    // 2) Personality (variant)
-    //
-    // IMPORTANT: keep the "wake-up" behavior for Variant 0 (Male) from the known-good build.
-    // Some SoftVoice installs won't actually synthesize Male unless we poke the personality state.
+    // UPDATED: More aggressive personality setting for fresh/cold engines
     if (st->api.sv_setPersonality && variantChanged) {
-        if (s.variant == 0) {
-            // Wake-up toggle: 0 -> 1 -> 0.
-            st->api.sv_setPersonality(h, 1);
-            Sleep(20);
+        // Toggle trick for ALL variants if this is the first apply, 
+        // to ensure the internal table wakes up from cold state.
+        if (firstApply) {
+             int toggleTarget = (s.variant == 0) ? 1 : 0;
+             st->api.sv_setPersonality(h, toggleTarget);
+             Sleep(20); // Give it time to digest
+             st->api.sv_setPersonality(h, s.variant);
+             Sleep(10); 
+        } else {
+            // Normal behavior for subsequent changes
+            if (s.variant == 0) {
+                st->api.sv_setPersonality(h, 1);
+                Sleep(20);
+            }
+            st->api.sv_setPersonality(h, s.variant);
         }
-        st->api.sv_setPersonality(h, s.variant);
     }
 
-    // 3) Speaking mode
-    //
-    // We implement word/spell modes in our own text splitter. Keep the engine in "Natural".
     if (firstApply && st->api.sv_setSpeakingMode) {
         st->api.sv_setSpeakingMode(h, 0);
     }
 
-    // 4) Always-safe knobs: Rate + Pitch
-    //
-    // Personality switches can reset internals, so we re-assert these after a preset change.
     if (st->api.sv_setRate && changedOrPreset([](const UiSettings& x) { return x.ratePct; })) {
         st->api.sv_setRate(h, PercentToParam(s.ratePct, 20, 500));
     }
@@ -880,15 +925,6 @@ static bool ApplyWrapperSettings(AppState* st, const UiSettings& s, const std::w
 
     const bool isMale = (s.variant == 0);
 
-    // 5) Timbre + style knobs
-    //
-    // The important trick for the fun personalities (Robotoid/Martian/etc):
-    // they come with their own internal defaults for perturb/biases/voicing/etc.
-    // If we blindly push our UI defaults, we overwrite those and the voice sounds wrong.
-    //
-    // Strategy (mirrors the NVDA driver):
-    //   - For Male (variant 0): do NOT push these knobs by default (male is fragile).
-    //   - For other variants: only push a knob if the user explicitly touched it.
     if (!isMale) {
         if (st->expInflection && st->api.sv_setF0Range && changedOrPreset([](const UiSettings& x) { return x.inflectionPct; })) {
             st->api.sv_setF0Range(h, PercentToParam(s.inflectionPct, 0, 500));
@@ -899,7 +935,6 @@ static bool ApplyWrapperSettings(AppState* st, const UiSettings& s, const std::w
         if (st->expVfactor && st->api.sv_setVowelFactor && changedOrPreset([](const UiSettings& x) { return x.vfactorPct; })) {
             st->api.sv_setVowelFactor(h, PercentToParam(s.vfactorPct, 0, 500));
         }
-
         if (st->expAvbias && st->api.sv_setAVBias && changedOrPreset([](const UiSettings& x) { return x.avbiasPct; })) {
             st->api.sv_setAVBias(h, PercentToParam(s.avbiasPct, -50, 50));
         }
@@ -909,8 +944,6 @@ static bool ApplyWrapperSettings(AppState* st, const UiSettings& s, const std::w
         if (st->expAhbias && st->api.sv_setAHBias && changedOrPreset([](const UiSettings& x) { return x.ahbiasPct; })) {
             st->api.sv_setAHBias(h, PercentToParam(s.ahbiasPct, -50, 50));
         }
-
-        // Enums (only if explicitly changed in the UI)
         if (st->expIntstyle && st->api.sv_setF0Style && changedOrPreset([](const UiSettings& x) { return x.intstyle; })) {
             st->api.sv_setF0Style(h, s.intstyle);
         }
@@ -925,7 +958,6 @@ static bool ApplyWrapperSettings(AppState* st, const UiSettings& s, const std::w
         }
     }
 
-    // Wrapper-only knobs (safe)
     if (st->api.sv_setPauseFactor && changedOrPreset([](const UiSettings& x) { return x.pausePct; })) {
         st->api.sv_setPauseFactor(h, 100 - s.pausePct);
         if (st->api.sv_setTrimSilence) {
@@ -964,9 +996,24 @@ static bool EnsureWrapperReady(AppState* st, const std::wstring& wrapperDllPath,
         }
     }
 
+    // BUG FIX: If user changed the engine path in the GUI, reload it!
+    if (st->api.handle && st->loadedTibasePath != tibasePath) {
+        if (st->api.sv_free) {
+            st->api.sv_free(st->api.handle);
+        }
+        st->api.handle = nullptr;
+        st->loadedTibasePath.clear();
+    }
+
     if (!st->api.handle) {
         st->api.handle = st->api.sv_initW(tibasePath.c_str(), 1);
         if (!st->api.handle) return false;
+        
+        // Track valid path
+        st->loadedTibasePath = tibasePath;
+        
+        // Force full settings re-application
+        st->lastAppliedValid = false; 
     }
     return true;
 }
@@ -979,12 +1026,19 @@ static bool PumpOneSegment(AppState* st, JobMode mode, const std::wstring& seg,
     if (seg.empty()) return true;
     if (st->cancelRequested.load()) return false;
 
-    st->api.sv_startSpeakW(st->api.handle, seg.c_str());
+    if (st->api.sv_startSpeakW(st->api.handle, seg.c_str()) != 0) {
+        PostStatus(st, L"Failed to queue text to SoftVoice.");
+        return false;
+    }
 
     std::vector<uint8_t> buf;
     buf.resize(32768);
 
-    bool playerOpened = (player != nullptr && *ioSampleRate > 0);
+    bool playerOpened = (player != nullptr && player->isOpen());
+    static constexpr long MAX_PENDING_WAVEOUT_BUFFERS = 16;
+
+    bool sawDone = false;
+    ULONGLONG lastAudioTick = 0;
 
     while (!st->cancelRequested.load()) {
         int t = SV_ITEM_NONE;
@@ -992,6 +1046,7 @@ static bool PumpOneSegment(AppState* st, JobMode mode, const std::wstring& seg,
         int n = st->api.sv_read(st->api.handle, &t, &v, buf.data(), (int)buf.size());
 
         if (t == SV_ITEM_AUDIO && n > 0) {
+            lastAudioTick = GetTickCount64();
             if (st->api.sv_getFormat && (*ioSampleRate <= 0 || *ioChannels <= 0 || *ioBits <= 0)) {
                 int sr = 0, ch = 0, bits = 0;
                 if (st->api.sv_getFormat(st->api.handle, &sr, &ch, &bits) == 1) {
@@ -1009,6 +1064,10 @@ static bool PumpOneSegment(AppState* st, JobMode mode, const std::wstring& seg,
                     playerOpened = player->open(sr, ch, bits);
                 }
                 if (playerOpened && player) {
+                    while (!st->cancelRequested.load() && player->pendingBuffers() >= MAX_PENDING_WAVEOUT_BUFFERS) {
+                        player->waitOneDone(50);
+                    }
+                    if (st->cancelRequested.load()) return false;
                     player->feed(buf.data(), (size_t)n);
                 }
             } else if (mode == JobMode::SaveWav) {
@@ -1020,7 +1079,10 @@ static bool PumpOneSegment(AppState* st, JobMode mode, const std::wstring& seg,
         }
 
         if (t == SV_ITEM_DONE) {
-            return true;
+            if (!sawDone) {
+                sawDone = true;
+                if (lastAudioTick == 0) lastAudioTick = GetTickCount64();
+            }
         }
         if (t == SV_ITEM_ERROR) {
             wchar_t tmp[128] = {};
@@ -1029,7 +1091,13 @@ static bool PumpOneSegment(AppState* st, JobMode mode, const std::wstring& seg,
             return false;
         }
 
-        // No data yet.
+        if (sawDone) {
+            ULONGLONG now = GetTickCount64();
+            if (lastAudioTick != 0 && (now - lastAudioTick) >= 60) {
+                return true;
+            }
+        }
+
         Sleep(1);
     }
     return false;
@@ -1059,7 +1127,6 @@ static void WorkerThread(AppState* st, JobMode mode, std::wstring wavOutPath) {
         return;
     }
 
-    // Snapshot settings + text
     const UiSettings settings = ReadSettingsFromUi(st->dlg);
     const std::wstring fullText = ReadTextBox(st->dlg);
     if (Trim(fullText).empty()) {
@@ -1070,7 +1137,6 @@ static void WorkerThread(AppState* st, JobMode mode, std::wstring wavOutPath) {
 
     st->cancelRequested.store(false);
 
-    // Stop any previous audio first (before changing personality/style).
     if (st->api.handle && st->api.sv_stop) {
         st->api.sv_stop(st->api.handle);
     }
@@ -1094,22 +1160,35 @@ static void WorkerThread(AppState* st, JobMode mode, std::wstring wavOutPath) {
     if (mode == JobMode::Speak) {
         PostStatus(st, L"Speaking...");
         WaveOutPlayer player;
+        bool ok = true;
         for (const auto& seg : segments) {
             if (st->cancelRequested.load()) break;
-            if (!PumpOneSegment(st, mode, seg, &player, nullptr, &inRate, &inCh, &inBits)) break;
+            if (!PumpOneSegment(st, mode, seg, &player, nullptr, &inRate, &inCh, &inBits)) {
+                ok = false;
+                break;
+            }
         }
+
         if (st->cancelRequested.load()) {
             player.stopNow();
             PostStatus(st, L"Stopped.");
+        } else if (!ok) {
+            player.stopNow();
         } else {
-            player.waitDrained(5000);
-            PostStatus(st, L"Done.");
+            while (!st->cancelRequested.load()) {
+                if (player.waitDrained(50)) break;
+            }
+            if (st->cancelRequested.load()) {
+                player.stopNow();
+                PostStatus(st, L"Stopped.");
+            } else {
+                PostStatus(st, L"Done.");
+            }
         }
         PostMessageW(st->dlg, WM_APP_DONE, 0, 0);
         return;
     }
 
-    // Save WAV
     PostStatus(st, L"Rendering WAV...");
     std::vector<uint8_t> raw;
     raw.reserve(1024 * 256);
@@ -1128,7 +1207,6 @@ static void WorkerThread(AppState* st, JobMode mode, std::wstring wavOutPath) {
     if (inCh <= 0) inCh = 1;
     if (inBits <= 0) inBits = 16;
 
-    // Convert to 11025 Hz, mono, 16-bit.
     std::vector<int16_t> mono = DecodeToMonoS16(raw, inCh, inBits);
     std::vector<int16_t> res = ResampleLinear(mono, inRate, TARGET_WAV_RATE);
     std::vector<uint8_t> pcm = EncodeMonoS16ToBytes(res);
@@ -1146,14 +1224,6 @@ static void WorkerThread(AppState* st, JobMode mode, std::wstring wavOutPath) {
 // -----------------------------------------------------------------------------
 // Dialog helpers
 // -----------------------------------------------------------------------------
-
-static void SetButtonsEnabled(HWND dlg, bool idle) {
-    EnableWindow(GetDlgItem(dlg, IDC_SPEAK), idle);
-    EnableWindow(GetDlgItem(dlg, IDC_SAVE_WAV), idle);
-    EnableWindow(GetDlgItem(dlg, IDC_OPEN_TEXT), idle);
-    EnableWindow(GetDlgItem(dlg, IDC_ENGINE_BROWSE), idle);
-    EnableWindow(GetDlgItem(dlg, IDC_STOP), !idle);
-}
 
 static void InitSpin(HWND dlg, int spinId, int minV, int maxV) {
     HWND sp = GetDlgItem(dlg, spinId);
@@ -1211,14 +1281,12 @@ static INT_PTR CALLBACK MainDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lP
 
         InitCommonControls();
 
-        // Default engine path: tibase32.dll next to exe.
         const std::wstring exeDir = GetExeDir();
         const std::wstring tibaseGuess = exeDir.empty() ? L"tibase32.dll" : (exeDir + L"\\tibase32.dll");
         if (FileExists(tibaseGuess)) {
             SetDlgItemTextW(dlg, IDC_ENGINE_PATH, tibaseGuess.c_str());
         }
 
-        // Spin ranges.
         InitSpin(dlg, IDC_RATE_SPIN, 0, 100);
         InitSpin(dlg, IDC_PITCH_SPIN, 0, 100);
         InitSpin(dlg, IDC_INFLECTION_SPIN, 0, 100);
@@ -1229,7 +1297,6 @@ static INT_PTR CALLBACK MainDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lP
         InitSpin(dlg, IDC_AFBIAS_SPIN, 0, 100);
         InitSpin(dlg, IDC_AHBIAS_SPIN, 0, 100);
 
-        // Default numeric values (match NVDA driver defaults).
         SetDlgItemInt(dlg, IDC_RATE, 50, FALSE);
         SetDlgItemInt(dlg, IDC_PITCH, 4, FALSE);
         SetDlgItemInt(dlg, IDC_INFLECTION, 25, FALSE);
@@ -1240,14 +1307,12 @@ static INT_PTR CALLBACK MainDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lP
         SetDlgItemInt(dlg, IDC_AFBIAS, 50, FALSE);
         SetDlgItemInt(dlg, IDC_AHBIAS, 50, FALSE);
 
-        // Fill combos.
         HWND voice = GetDlgItem(dlg, IDC_VOICE);
         ComboAdd(voice, 1, L"English");
         ComboAdd(voice, 2, L"Spanish");
         ComboSelectByData(voice, 1);
 
         HWND variant = GetDlgItem(dlg, IDC_VARIANT);
-        // Personality list copied from the NVDA driver.
         ComboAdd(variant, 0, L"Male");
         ComboAdd(variant, 1, L"Female");
         ComboAdd(variant, 2, L"Large Male");
@@ -1310,7 +1375,6 @@ static INT_PTR CALLBACK MainDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lP
         ComboSelectByData(glot, 0);
 
         SetDlgItemTextW(dlg, IDC_STATUS, L"Ready.");
-        SetButtonsEnabled(dlg, true);
         st->initializing = false;
         return TRUE;
     }
@@ -1321,10 +1385,6 @@ static INT_PTR CALLBACK MainDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lP
 
         if (!st) return FALSE;
 
-        // Track which "timbre/style" knobs the user explicitly touched.
-        //
-        // For non-Male personalities, we avoid pushing our default knob values into the engine
-        // unless the user has changed them (otherwise we stomp the personality's own defaults).
         if (!st->initializing) {
             if (code == EN_CHANGE) {
                 switch (id) {
@@ -1350,6 +1410,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lP
 
         switch (id) {
         case IDC_ENGINE_BROWSE: {
+            if (st->jobRunning.load()) return TRUE;
             const wchar_t* filter = L"SoftVoice engine (tibase32.dll)\0tibase32.dll\0\0";
             std::wstring p = BrowseForFile(dlg, false, L"Select tibase32.dll", filter, L"dll");
             if (!p.empty()) {
@@ -1362,6 +1423,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lP
             return TRUE;
         }
         case IDC_OPEN_TEXT: {
+            if (st->jobRunning.load()) return TRUE;
             const wchar_t* filter = L"Text files\0*.txt;*.text\0All files\0*.*\0\0";
             std::wstring p = BrowseForFile(dlg, false, L"Open text file", filter, nullptr);
             if (!p.empty()) LoadTextFileIntoEdit(dlg, p);
@@ -1371,7 +1433,10 @@ static INT_PTR CALLBACK MainDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lP
             if (st->jobRunning.load()) return TRUE;
             st->jobRunning.store(true);
             st->cancelRequested.store(false);
-            SetButtonsEnabled(dlg, false);
+            st->closing.store(false);
+            
+            // NOTE: Buttons are left enabled (fix for focus issue)
+            
             {
                 std::lock_guard<std::mutex> g(st->statusMtx);
                 st->pendingStatus = L"Starting...";
@@ -1389,7 +1454,8 @@ static INT_PTR CALLBACK MainDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lP
 
             st->jobRunning.store(true);
             st->cancelRequested.store(false);
-            SetButtonsEnabled(dlg, false);
+            st->closing.store(false);
+
             SetDlgItemTextW(dlg, IDC_STATUS, L"Starting...");
             st->worker = std::thread(WorkerThread, st, JobMode::SaveWav, out);
             return TRUE;
@@ -1415,6 +1481,9 @@ static INT_PTR CALLBACK MainDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lP
 
     case WM_APP_STATUS: {
         if (!st) return TRUE;
+        // If we are in the middle of closing, don't update UI text
+        if (st->closing.load()) return TRUE;
+        
         std::wstring msg;
         {
             std::lock_guard<std::mutex> g(st->statusMtx);
@@ -1426,10 +1495,15 @@ static INT_PTR CALLBACK MainDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lP
 
     case WM_APP_DONE: {
         if (!st) return TRUE;
+        
+        // VITAL FIX: If the main thread is already running the shutdown loop in WM_CLOSE,
+        // we must NOT join the thread here. WM_CLOSE owns the join.
+        // Joining here would invalidate the thread handle WM_CLOSE is waiting on.
+        if (st->closing.load()) return TRUE;
+
         if (st->worker.joinable()) st->worker.join();
         st->jobRunning.store(false);
         st->cancelRequested.store(false);
-        SetButtonsEnabled(dlg, true);
         return TRUE;
     }
 
@@ -1438,11 +1512,38 @@ static INT_PTR CALLBACK MainDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lP
             EndDialog(dlg, 0);
             return TRUE;
         }
+        
+        // Hide window immediately so user knows "it's gone", even if we spend a second cleaning up.
+        // This solves the "tabbing moves focus nowhere" perception issue.
+        ShowWindow(dlg, SW_HIDE);
+
+        st->closing.store(true); // Flag to tell WM_APP_DONE to back off
 
         if (st->jobRunning.load()) {
             st->cancelRequested.store(true);
             if (st->api.handle && st->api.sv_stop) st->api.sv_stop(st->api.handle);
-            if (st->worker.joinable()) st->worker.join();
+
+            // Wait for worker to exit, pumping messages so we don't hang the UI thread.
+            // Since st->closing is true, WM_APP_DONE will be effectively ignored.
+            if (st->worker.joinable()) {
+                HANDLE hThread = st->worker.native_handle();
+                while (true) {
+                    DWORD res = MsgWaitForMultipleObjects(1, &hThread, FALSE, 250, QS_ALLINPUT);
+                    if (res == WAIT_OBJECT_0) {
+                        // Thread signaled - safe to join now
+                        st->worker.join();
+                        break;
+                    }
+                    if (res == WAIT_OBJECT_0 + 1) {
+                        // Process messages while waiting
+                        MSG msg;
+                        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                            TranslateMessage(&msg);
+                            DispatchMessageW(&msg);
+                        }
+                    }
+                }
+            }
             st->jobRunning.store(false);
         }
         st->api.unload();

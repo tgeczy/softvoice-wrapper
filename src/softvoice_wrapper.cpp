@@ -175,6 +175,12 @@ struct SV_STATE {
     // Path we were initialized with (used to validate repeated inits).
     std::wstring baseDllPath;
 
+    // SoftVoice sync message routing.
+    // We learn the actual message id used by the engine to avoid false DONE events
+    // from unrelated Win32 messages like WM_TIMER.
+    UINT svSyncMsg = 0;       // RegisterWindowMessageW(L"SVSyncMessages") (0 if unavailable)
+    UINT activeSyncMsg = 0;   // Message id actually observed from the engine (learned)
+
     // Exports
     SVOpenSpeechFunc  svOpenSpeech = nullptr;
     SVCloseSpeechFunc svCloseSpeech = nullptr;
@@ -642,15 +648,37 @@ static void ensureHooksInstalled() {
     static LONG once = 0;
     if (InterlockedCompareExchange(&once, 1, 0) != 0) return;
 
+    // Make sure the modules are loaded before we try to hook them.
+    // (MinHook's MH_CreateHookApi uses GetModuleHandle internally.)
+    LoadLibraryW(L"winmm.dll");
+    LoadLibraryW(L"winmmbase.dll"); // present on newer Windows; harmless if absent.
+
     MH_STATUS st = MH_Initialize();
     if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) return;
 
-    MH_CreateHookApi(L"winmm.dll", "waveOutOpen", (LPVOID)hook_waveOutOpen, (LPVOID*)&g_waveOutOpenOrig);
-    MH_CreateHookApi(L"winmm.dll", "waveOutPrepareHeader", (LPVOID)hook_waveOutPrepareHeader, (LPVOID*)&g_waveOutPrepareHeaderOrig);
-    MH_CreateHookApi(L"winmm.dll", "waveOutUnprepareHeader", (LPVOID)hook_waveOutUnprepareHeader, (LPVOID*)&g_waveOutUnprepareHeaderOrig);
-    MH_CreateHookApi(L"winmm.dll", "waveOutWrite", (LPVOID)hook_waveOutWrite, (LPVOID*)&g_waveOutWriteOrig);
-    MH_CreateHookApi(L"winmm.dll", "waveOutReset", (LPVOID)hook_waveOutReset, (LPVOID*)&g_waveOutResetOrig);
-    MH_CreateHookApi(L"winmm.dll", "waveOutClose", (LPVOID)hook_waveOutClose, (LPVOID*)&g_waveOutCloseOrig);
+    auto tryHookApi = [&](const wchar_t* mod, const char* proc, LPVOID detour, LPVOID* orig) -> bool {
+        MH_STATUS rc = MH_CreateHookApi(mod, proc, detour, orig);
+        return (rc == MH_OK || rc == MH_ERROR_ALREADY_CREATED);
+    };
+
+    auto hookEither = [&](const char* proc, LPVOID detour, LPVOID* orig) -> bool {
+        // Try winmm.dll first, then fall back to winmmbase.dll (needed on some Windows builds).
+        if (tryHookApi(L"winmm.dll", proc, detour, orig)) return true;
+        if (tryHookApi(L"winmmbase.dll", proc, detour, orig)) return true;
+        return false;
+    };
+
+    const bool okOpen = hookEither("waveOutOpen", (LPVOID)hook_waveOutOpen, (LPVOID*)&g_waveOutOpenOrig);
+    const bool okPrep = hookEither("waveOutPrepareHeader", (LPVOID)hook_waveOutPrepareHeader, (LPVOID*)&g_waveOutPrepareHeaderOrig);
+    const bool okUnprep = hookEither("waveOutUnprepareHeader", (LPVOID)hook_waveOutUnprepareHeader, (LPVOID*)&g_waveOutUnprepareHeaderOrig);
+    const bool okWrite = hookEither("waveOutWrite", (LPVOID)hook_waveOutWrite, (LPVOID*)&g_waveOutWriteOrig);
+    const bool okReset = hookEither("waveOutReset", (LPVOID)hook_waveOutReset, (LPVOID*)&g_waveOutResetOrig);
+    const bool okClose = hookEither("waveOutClose", (LPVOID)hook_waveOutClose, (LPVOID*)&g_waveOutCloseOrig);
+
+    // Avoid enabling partial hooks (that can lead to "silent" output).
+    if (!(okOpen && okPrep && okUnprep && okWrite && okReset && okClose)) {
+        return;
+    }
 
     MH_EnableHook(MH_ALL_HOOKS);
 }
@@ -662,25 +690,49 @@ static const wchar_t* kSvWrapWndClass = L"NVDA_SoftVoice_WrapWnd";
 
 static LRESULT CALLBACK svWrapWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     SV_STATE* s = g_state;
-    if (s && hwnd == s->msgWnd) {
-        // SoftVoice (legacy) appears to use wParam codes:
-        // 1000 = started, 1001 = done, 1002 = error/other.
-        if (wParam == 1000) {
-            if (s->startEvent) SetEvent(s->startEvent);
-            return 0;
+    if (!s || hwnd != s->msgWnd) {
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+
+    // SoftVoice uses small integer codes in wParam:
+    // 1000 = started, 1001 = done, 1002 = error/other.
+    // IMPORTANT: Do NOT treat these as events unless they arrive on the synthesizer's
+    // dedicated sync message id. Otherwise, unrelated Win32 messages (notably WM_TIMER)
+    // can carry the same wParam values and cause premature DONE, truncating speech.
+    if (wParam != 1000 && wParam != 1001 && wParam != 1002) {
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+
+    // If we've already learned the engine's sync message id, require it.
+    if (s->activeSyncMsg != 0) {
+        if ((UINT)msg != s->activeSyncMsg) {
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
         }
-        if (wParam == 1001) {
-            if (s->doneEvent) SetEvent(s->doneEvent);
-            return 0;
-        }
-        if (wParam == 1002) {
-            // Treat as done; the worker will push an ERROR marker if needed.
-            if (s->doneEvent) SetEvent(s->doneEvent);
-            return 0;
+    } else {
+        // Prefer the registered message id if available.
+        if (s->svSyncMsg != 0 && (UINT)msg == s->svSyncMsg) {
+            s->activeSyncMsg = (UINT)msg;
+        } else {
+            // Learn from the first plausible message id in the WM_USER/registered range.
+            // This avoids WM_TIMER/WM_COMMAND (which are < WM_USER) collisions.
+            if (msg < WM_USER) {
+                return DefWindowProcW(hwnd, msg, wParam, lParam);
+            }
+            s->activeSyncMsg = (UINT)msg;
         }
     }
 
-    return DefWindowProcW(hwnd, msg, wParam, lParam);
+    if (wParam == 1000) {
+        if (s->startEvent) SetEvent(s->startEvent);
+        return 0;
+    }
+    if (wParam == 1001) {
+        if (s->doneEvent) SetEvent(s->doneEvent);
+        return 0;
+    }
+    // 1002: Treat as done; the worker will push an ERROR marker if needed.
+    if (s->doneEvent) SetEvent(s->doneEvent);
+    return 0;
 }
 
 static bool ensureMsgWindowCreated(SV_STATE* s) {
@@ -1282,6 +1334,9 @@ extern "C" SV_API SV_STATE* __cdecl sv_initW(const wchar_t* baseDllPath, int ini
     s->baseModule = base;
     s->engModule = eng;
     s->spanModule = span;
+
+    s->svSyncMsg = RegisterWindowMessageW(L"SVSyncMessages");
+    s->activeSyncMsg = 0;
 
     s->svOpenSpeech = (SVOpenSpeechFunc)getProcMaybeDecorated(base, "SVOpenSpeech", "_SVOpenSpeech@20");
     s->svCloseSpeech = (SVCloseSpeechFunc)getProcMaybeDecorated(base, "SVCloseSpeech", "_SVCloseSpeech@4");

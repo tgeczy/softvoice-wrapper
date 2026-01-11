@@ -60,8 +60,11 @@ BEGIN
     // Actions
     PUSHBUTTON      "&Open text file...",   IDC_OPEN_FILE,     8,  205, 110,  16, WS_TABSTOP
     PUSHBUTTON      "&Speak",               IDC_SPEAK,       130, 205,  70,  16, WS_TABSTOP
-    PUSHBUTTON      "S&top",                IDC_STOP,        210, 205,  70,  16, WS_TABSTOP
+    PUSHBUTTON      "S&top",                IDC_STOP,        210, 205,  70,  16, WS_TABSTOP | WS_DISABLED
     PUSHBUTTON      "Save &WAV...",         IDC_SAVE_WAV,    290, 205,  80,  16, WS_TABSTOP
+
+    // Status
+    LTEXT           "Ready.",               IDC_STATUS,         8,  228, 362,  50
 
     // Close
     DEFPUSHBUTTON   "Close",                IDCANCEL,        290, 285,  80,  16, WS_TABSTOP
