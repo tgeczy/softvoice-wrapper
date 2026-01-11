@@ -8,7 +8,7 @@
 //
 /////////////////////////////////////////////////////////////////////////////
 
-IDD_SOFTVOICE_SAY DIALOGEX 0, 0, 380, 310
+IDD_SOFTVOICE_SAY DIALOGEX 0, 0, 380, 380
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "SoftVoice Speak"
 FONT 9, "Segoe UI"
@@ -42,6 +42,36 @@ BEGIN
                     UDS_SETBUDDYINT | UDS_ALIGNRIGHT,
                     105, 173, 12, 14
 
+    LTEXT           "P&erturbation:",       -1,                8, 195, 70, 10
+    EDITTEXT        IDC_PERTURB,             80, 193, 40,  14, ES_NUMBER | WS_TABSTOP
+    CONTROL         "", IDC_PERTURB_SPIN, "msctls_updown32",
+                    UDS_SETBUDDYINT | UDS_ALIGNRIGHT,
+                    120, 193, 12, 14
+
+    LTEXT           "&Vowel factor:",       -1,                8, 215, 70, 10
+    EDITTEXT        IDC_VFACTOR,             80, 213, 40,  14, ES_NUMBER | WS_TABSTOP
+    CONTROL         "", IDC_VFACTOR_SPIN, "msctls_updown32",
+                    UDS_SETBUDDYINT | UDS_ALIGNRIGHT,
+                    120, 213, 12, 14
+
+    LTEXT           "Voicing &gain:",       -1,                8, 235, 70, 10
+    EDITTEXT        IDC_AVBIAS,              80, 233, 40,  14, ES_NUMBER | WS_TABSTOP
+    CONTROL         "", IDC_AVBIAS_SPIN, "msctls_updown32",
+                    UDS_SETBUDDYINT | UDS_ALIGNRIGHT,
+                    120, 233, 12, 14
+
+    LTEXT           "F&rication gain:",     -1,                8, 255, 70, 10
+    EDITTEXT        IDC_AFBIAS,              80, 253, 40,  14, ES_NUMBER | WS_TABSTOP
+    CONTROL         "", IDC_AFBIAS_SPIN, "msctls_updown32",
+                    UDS_SETBUDDYINT | UDS_ALIGNRIGHT,
+                    120, 253, 12, 14
+
+    LTEXT           "&Aspiration gain:",    -1,                8, 275, 80, 10
+    EDITTEXT        IDC_AHBIAS,              90, 273, 40,  14, ES_NUMBER | WS_TABSTOP
+    CONTROL         "", IDC_AHBIAS_SPIN, "msctls_updown32",
+                    UDS_SETBUDDYINT | UDS_ALIGNRIGHT,
+                    130, 273, 12, 14
+
     // Voice parameters (right column)
     LTEXT           "&Pause factor:",       -1,              150, 135, 70, 10
     EDITTEXT        IDC_PAUSE,              225, 133, 40,  14, ES_NUMBER | WS_TABSTOP
@@ -49,23 +79,43 @@ BEGIN
                     UDS_SETBUDDYINT | UDS_ALIGNRIGHT,
                     265, 133, 12, 14
 
-    LTEXT           "&Variant:",            -1,              150, 155, 55, 10
-    COMBOBOX        IDC_VARIANT,            225, 153, 145, 80,
+    LTEXT           "&Voice:",              -1,              150, 155, 55, 10
+    COMBOBOX        IDC_VOICE,              225, 153, 145, 80,
                     CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
 
-    LTEXT           "Speaking &mode:",      -1,              150, 175, 85, 10
-    COMBOBOX        IDC_SPEAKING_MODE,      235, 173, 135, 80,
+    LTEXT           "&Variant:",            -1,              150, 175, 55, 10
+    COMBOBOX        IDC_VARIANT,            225, 173, 145, 80,
+                    CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    LTEXT           "Speaking &mode:",      -1,              150, 195, 85, 10
+    COMBOBOX        IDC_SPEAKING_MODE,      235, 193, 135, 80,
+                    CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    LTEXT           "&Intonation:",         -1,              150, 215, 70, 10
+    COMBOBOX        IDC_INTSTYLE,           225, 213, 145, 80,
+                    CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    LTEXT           "V&oicing mode:",       -1,              150, 235, 75, 10
+    COMBOBOX        IDC_VMODE,              225, 233, 145, 80,
+                    CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    LTEXT           "&Gender:",             -1,              150, 255, 50, 10
+    COMBOBOX        IDC_GENDER,             225, 253, 145, 80,
+                    CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    LTEXT           "G&lottal source:",     -1,              150, 275, 80, 10
+    COMBOBOX        IDC_GLOT,               225, 273, 145, 80,
                     CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
 
     // Actions
-    PUSHBUTTON      "&Open text file...",   IDC_OPEN_FILE,     8,  205, 110,  16, WS_TABSTOP
-    PUSHBUTTON      "&Speak",               IDC_SPEAK,       130, 205,  70,  16, WS_TABSTOP
-    PUSHBUTTON      "S&top",                IDC_STOP,        210, 205,  70,  16, WS_TABSTOP | WS_DISABLED
-    PUSHBUTTON      "Save &WAV...",         IDC_SAVE_WAV,    290, 205,  80,  16, WS_TABSTOP
+    PUSHBUTTON      "&Open text file...",   IDC_OPEN_FILE,     8,  305, 110,  16, WS_TABSTOP
+    PUSHBUTTON      "&Speak",               IDC_SPEAK,       130, 305,  70,  16, WS_TABSTOP
+    PUSHBUTTON      "S&top",                IDC_STOP,        210, 305,  70,  16, WS_TABSTOP | WS_DISABLED
+    PUSHBUTTON      "Save &WAV...",         IDC_SAVE_WAV,    290, 305,  80,  16, WS_TABSTOP
 
     // Status
-    LTEXT           "Ready.",               IDC_STATUS,         8,  228, 362,  50
+    LTEXT           "Ready.",               IDC_STATUS,         8,  328, 362,  40
 
     // Close
-    DEFPUSHBUTTON   "Close",                IDCANCEL,        290, 285,  80,  16, WS_TABSTOP
+    DEFPUSHBUTTON   "Close",                IDCANCEL,        290, 355,  80,  16, WS_TABSTOP
 END

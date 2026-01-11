@@ -923,39 +923,35 @@ static bool ApplyWrapperSettings(AppState* st, const UiSettings& s, const std::w
         st->api.sv_setPitch(h, PercentToParam(s.pitchPct, 10, 2000));
     }
 
-    const bool isMale = (s.variant == 0);
-
-    if (!isMale) {
-        if (st->expInflection && st->api.sv_setF0Range && changedOrPreset([](const UiSettings& x) { return x.inflectionPct; })) {
-            st->api.sv_setF0Range(h, PercentToParam(s.inflectionPct, 0, 500));
-        }
-        if (st->expPerturb && st->api.sv_setF0Perturb && changedOrPreset([](const UiSettings& x) { return x.perturbPct; })) {
-            st->api.sv_setF0Perturb(h, PercentToParam(s.perturbPct, 0, 500));
-        }
-        if (st->expVfactor && st->api.sv_setVowelFactor && changedOrPreset([](const UiSettings& x) { return x.vfactorPct; })) {
-            st->api.sv_setVowelFactor(h, PercentToParam(s.vfactorPct, 0, 500));
-        }
-        if (st->expAvbias && st->api.sv_setAVBias && changedOrPreset([](const UiSettings& x) { return x.avbiasPct; })) {
-            st->api.sv_setAVBias(h, PercentToParam(s.avbiasPct, -50, 50));
-        }
-        if (st->expAfbias && st->api.sv_setAFBias && changedOrPreset([](const UiSettings& x) { return x.afbiasPct; })) {
-            st->api.sv_setAFBias(h, PercentToParam(s.afbiasPct, -50, 50));
-        }
-        if (st->expAhbias && st->api.sv_setAHBias && changedOrPreset([](const UiSettings& x) { return x.ahbiasPct; })) {
-            st->api.sv_setAHBias(h, PercentToParam(s.ahbiasPct, -50, 50));
-        }
-        if (st->expIntstyle && st->api.sv_setF0Style && changedOrPreset([](const UiSettings& x) { return x.intstyle; })) {
-            st->api.sv_setF0Style(h, s.intstyle);
-        }
-        if (st->expVmode && st->api.sv_setVoicingMode && changedOrPreset([](const UiSettings& x) { return x.vmode; })) {
-            st->api.sv_setVoicingMode(h, s.vmode);
-        }
-        if (st->expGender && st->api.sv_setGender && changedOrPreset([](const UiSettings& x) { return x.gender; })) {
-            st->api.sv_setGender(h, s.gender);
-        }
-        if (st->expGlot && st->api.sv_setGlottalSource && changedOrPreset([](const UiSettings& x) { return x.glot; })) {
-            st->api.sv_setGlottalSource(h, s.glot);
-        }
+    if (st->expInflection && st->api.sv_setF0Range && changedOrPreset([](const UiSettings& x) { return x.inflectionPct; })) {
+        st->api.sv_setF0Range(h, PercentToParam(s.inflectionPct, 0, 500));
+    }
+    if (st->expPerturb && st->api.sv_setF0Perturb && changedOrPreset([](const UiSettings& x) { return x.perturbPct; })) {
+        st->api.sv_setF0Perturb(h, PercentToParam(s.perturbPct, 0, 500));
+    }
+    if (st->expVfactor && st->api.sv_setVowelFactor && changedOrPreset([](const UiSettings& x) { return x.vfactorPct; })) {
+        st->api.sv_setVowelFactor(h, PercentToParam(s.vfactorPct, 0, 500));
+    }
+    if (st->expAvbias && st->api.sv_setAVBias && changedOrPreset([](const UiSettings& x) { return x.avbiasPct; })) {
+        st->api.sv_setAVBias(h, PercentToParam(s.avbiasPct, -50, 50));
+    }
+    if (st->expAfbias && st->api.sv_setAFBias && changedOrPreset([](const UiSettings& x) { return x.afbiasPct; })) {
+        st->api.sv_setAFBias(h, PercentToParam(s.afbiasPct, -50, 50));
+    }
+    if (st->expAhbias && st->api.sv_setAHBias && changedOrPreset([](const UiSettings& x) { return x.ahbiasPct; })) {
+        st->api.sv_setAHBias(h, PercentToParam(s.ahbiasPct, -50, 50));
+    }
+    if (st->expIntstyle && st->api.sv_setF0Style && changedOrPreset([](const UiSettings& x) { return x.intstyle; })) {
+        st->api.sv_setF0Style(h, s.intstyle);
+    }
+    if (st->expVmode && st->api.sv_setVoicingMode && changedOrPreset([](const UiSettings& x) { return x.vmode; })) {
+        st->api.sv_setVoicingMode(h, s.vmode);
+    }
+    if (st->expGender && st->api.sv_setGender && changedOrPreset([](const UiSettings& x) { return x.gender; })) {
+        st->api.sv_setGender(h, s.gender);
+    }
+    if (st->expGlot && st->api.sv_setGlottalSource && changedOrPreset([](const UiSettings& x) { return x.glot; })) {
+        st->api.sv_setGlottalSource(h, s.glot);
     }
 
     if (st->api.sv_setPauseFactor && changedOrPreset([](const UiSettings& x) { return x.pausePct; })) {
