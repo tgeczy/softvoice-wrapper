@@ -1338,11 +1338,10 @@ static INT_PTR CALLBACK MainDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lP
         ComboSelectByData(smode, 0);
 
         HWND intstyle = GetDlgItem(dlg, IDC_INTSTYLE);
-        ComboAdd(intstyle, 0, L"normal1");
-        ComboAdd(intstyle, 1, L"normal2");
-        ComboAdd(intstyle, 2, L"monotone");
-        ComboAdd(intstyle, 3, L"sung");
-        ComboAdd(intstyle, 4, L"random");
+        ComboAdd(intstyle, 0, L"Normal");
+        ComboAdd(intstyle, 1, L"Monotone");
+        ComboAdd(intstyle, 2, L"Sung");
+        ComboAdd(intstyle, 3, L"Random");
         ComboSelectByData(intstyle, 0);
 
         HWND vmode = GetDlgItem(dlg, IDC_VMODE);
