@@ -469,6 +469,37 @@ static std::string sanitizeForSoftVoiceCp1252(const wchar_t* in) {
     return collapsed;
 }
 
+static std::vector<std::string> splitSoftVoiceTextIntoChunks(const std::string& text, size_t chunkChars) {
+    std::vector<std::string> out;
+    if (text.empty() || chunkChars == 0) return out;
+
+    size_t start = 0;
+    while (start < text.size()) {
+        const size_t remaining = text.size() - start;
+        if (remaining <= chunkChars) {
+            out.push_back(text.substr(start));
+            break;
+        }
+
+        // Find the first space after the chunk boundary so we don't split mid-word.
+        size_t split = text.find(' ', start + chunkChars);
+        if (split == std::string::npos) {
+            // No space found; hard-split to guarantee progress.
+            split = start + chunkChars;
+        }
+
+        if (split > start) {
+            out.push_back(text.substr(start, split - start));
+        }
+
+        // Skip one (or more) spaces so the next chunk doesn't start with whitespace.
+        start = split;
+        while (start < text.size() && text[start] == ' ') ++start;
+    }
+
+    return out;
+}
+
 static void enqueueAudioFromHook(SV_STATE* s, uint32_t gen, const void* data, size_t size, bool* outWasEmpty, bool* outWasFull) {
     if (outWasEmpty) *outWasEmpty = false;
     if (outWasFull) *outWasFull = false;
@@ -1197,51 +1228,84 @@ static void workerLoop(SV_STATE* s, int initialVoice) {
             continue;
         }
 
-        int rc = seh_svTTS(s->svTTS, s->svHandle, safe.c_str(), 0, 0, s->msgWnd, 0, 0, 0);
-        if (rc != 0) {
+        // Split long inputs into ~350-char chunks (split on the first space after 350 chars).
+        const size_t kChunkChars = 350;
+        std::vector<std::string> chunks = splitSoftVoiceTextIntoChunks(safe, kChunkChars);
+        if (chunks.empty()) {
             s->activeGen.store(0, std::memory_order_relaxed);
-            pushMarker(s, SV_ITEM_ERROR, 2001, gen);
             pushMarker(s, SV_ITEM_DONE, 0, gen);
             continue;
         }
 
-        // Wait for done or stop/cancel, while pumping messages.
-        const auto t0 = std::chrono::steady_clock::now();
         const auto maxDur = std::chrono::seconds(180);
-
         HANDLE waits[2] = { s->doneEvent, s->stopEvent };
 
         bool stopped = false;
-        while (true) {
-            DWORD w = MsgWaitForMultipleObjectsEx(
-                2,
-                waits,
-                50,
-                QS_ALLINPUT,
-                MWMO_INPUTAVAILABLE
-            );
+        bool ttsError = false;
 
-            if (w == WAIT_OBJECT_0) {
-                // doneEvent
-                break;
-            }
-            if (w == WAIT_OBJECT_0 + 1) {
-                stopped = true;
-                break;
-            }
-            if (w == WAIT_OBJECT_0 + 2) {
-                pumpMessages();
-            }
+        for (const std::string& chunk : chunks) {
+            if (chunk.empty()) continue;
 
             if (s->cancelToken.load(std::memory_order_relaxed) != snap) {
                 stopped = true;
                 break;
             }
-            if (std::chrono::steady_clock::now() - t0 > maxDur) {
-                pushMarker(s, SV_ITEM_ERROR, 2002, gen);
+            if (WaitForSingleObject(s->stopEvent, 0) == WAIT_OBJECT_0) {
                 stopped = true;
                 break;
             }
+
+            ResetEvent(s->doneEvent);
+            if (s->startEvent) ResetEvent(s->startEvent);
+
+            int rc = seh_svTTS(s->svTTS, s->svHandle, chunk.c_str(), 0, 0, s->msgWnd, 0, 0, 0);
+            if (rc != 0) {
+                ttsError = true;
+                break;
+            }
+
+            // Wait for this chunk to finish, while pumping messages.
+            const auto t0 = std::chrono::steady_clock::now();
+            while (true) {
+                DWORD w = MsgWaitForMultipleObjectsEx(
+                    2,
+                    waits,
+                    50,
+                    QS_ALLINPUT,
+                    MWMO_INPUTAVAILABLE
+                );
+
+                if (w == WAIT_OBJECT_0) {
+                    // doneEvent
+                    break;
+                }
+                if (w == WAIT_OBJECT_0 + 1) {
+                    stopped = true;
+                    break;
+                }
+                if (w == WAIT_OBJECT_0 + 2) {
+                    pumpMessages();
+                }
+
+                if (s->cancelToken.load(std::memory_order_relaxed) != snap) {
+                    stopped = true;
+                    break;
+                }
+                if (std::chrono::steady_clock::now() - t0 > maxDur) {
+                    pushMarker(s, SV_ITEM_ERROR, 2002, gen);
+                    stopped = true;
+                    break;
+                }
+            }
+
+            if (stopped) break;
+        }
+
+        if (ttsError) {
+            s->activeGen.store(0, std::memory_order_relaxed);
+            pushMarker(s, SV_ITEM_ERROR, 2001, gen);
+            pushMarker(s, SV_ITEM_DONE, 0, gen);
+            continue;
         }
 
         if (stopped) {
