@@ -1,0 +1,619 @@
+# -*- coding: utf-8 -*-
+# synthDrivers/sv.py
+#
+# SoftVoice (late 90s) NVDA synth driver.
+#
+# FINAL FIXES:
+# 1. PAUSE FACTOR INVERTED:
+#    - Slider 0 (User) -> DLL 100 (Engine) = Zero Pauses (Robot).
+#    - Slider 100 (User) -> DLL 0 (Engine) = Full Natural Pauses.
+#
+# 2. SECRET WEAPON (sv_setTrimSilence):
+#    - Automatically enables 'Trim Silence' when the slider is below 50 (low pauses).
+#    - This forces the engine to cut startup latency for fast response.
+#
+# 3. EXPLICIT PARAMETER LOGIC:
+#    - Custom personalities (Martian, etc.) now retain their native pitch/timbre
+#      unless the user explicitly moves a slider while on that voice.
+#    - Switching back to 'Male' forces all user sliders to re-apply.
+
+import os
+import ctypes
+import threading
+import queue
+import time
+import re
+from collections import OrderedDict
+
+from logHandler import log
+from synthDriverHandler import SynthDriver, VoiceInfo, synthDoneSpeaking, synthIndexReached
+from speech.commands import IndexCommand
+from autoSettingsUtils.driverSetting import DriverSetting, NumericDriverSetting, BooleanDriverSetting
+
+from . import _softvoice
+
+MAX_STRING_LENGTH = 1200
+
+# --- Background Thread ---
+class _BgThread(threading.Thread):
+    def __init__(self, q: "queue.Queue", stopEvent: "threading.Event"):
+        super().__init__(name=f"{self.__class__.__module__}.{self.__class__.__qualname__}")
+        self.daemon = True
+        self._q = q
+        self._stop = stopEvent
+
+    def run(self):
+        while not self._stop.is_set():
+            try:
+                item = self._q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                if item is None: return
+                func, args, kwargs = item
+                func(*args, **kwargs)
+            except Exception:
+                log.error("SoftVoice: error running background synth function", exc_info=True)
+            finally:
+                try: self._q.task_done()
+                except Exception: pass
+
+# --- Text Cleaning ---
+_PUNCT_TRANSLATE = str.maketrans({
+    "’": "'", "‘": "'", "“": '"', "”": '"', "–": "-", "—": "-", "…": "...", "\u00a0": " ",
+})
+_control_re = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]+")
+_STRIP_CHARS = {"\ufeff", "\u00ad", "\u200b", "\u200c", "\u200d", "\u200e", "\u200f"}
+_labelColonRe = re.compile(r"([A-Za-z]{2,})\s*:\s*([A-Za-z])")
+_labelSemiRe = re.compile(r"([A-Za-z]{2,})\s*;\s*([A-Za-z])")
+_spellWordRe = re.compile(r"[A-Za-z0-9]+")
+_acronymWordRe = re.compile(r"\b[A-Z]{2,5}\b")
+
+def _applyAcronymSpacing(s: str) -> str:
+    """Insert spaces into short ALL-CAPS words: NVDA -> N V D A.
+    This helps avoid SoftVoice expanding acronyms into unintended words.
+    """
+    def _repl(m: re.Match) -> str:
+        w = m.group(0)
+        return " ".join(list(w))
+    return _acronymWordRe.sub(_repl, s)
+
+# --- Number processing (optional) ---
+# SoftVoice sometimes spells long digit runs. We can pre-expand numbers into words before handing text to the engine.
+_numberTokenRe = re.compile(r"\b\d{1,3}(?:,\d{3})+\b|\b\d+\b")
+_validCommaNumberRe = re.compile(r"^\d{1,3}(?:,\d{3})+$")
+
+_EN_ONES = (
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
+)
+_EN_TENS = ("", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety")
+_EN_SCALES = (
+    (10**18, "quintillion"),
+    (10**15, "quadrillion"),
+    (10**12, "trillion"),
+    (10**9, "billion"),
+    (10**6, "million"),
+    (10**3, "thousand"),
+    (1, ""),
+)
+
+def _enUnder1000(n: int) -> str:
+    n = int(n)
+    if n <= 0:
+        return "zero"
+    parts = []
+    if n >= 100:
+        parts.append(_EN_ONES[n // 100])
+        parts.append("hundred")
+        n = n % 100
+    if n >= 20:
+        parts.append(_EN_TENS[n // 10])
+        n = n % 10
+        if n:
+            parts.append(_EN_ONES[n])
+    elif n > 0:
+        parts.append(_EN_ONES[n])
+    return " ".join(parts)
+
+def _intToWordsEn(n: int) -> str:
+    n = int(n)
+    if n == 0:
+        return "zero"
+    if n < 0:
+        return "minus " + _intToWordsEn(-n)
+    parts = []
+    for scale, name in _EN_SCALES:
+        if n < scale:
+            continue
+        chunk = n // scale
+        n = n % scale
+        if chunk:
+            parts.append(_enUnder1000(chunk))
+            if name:
+                parts.append(name)
+    return " ".join(parts).strip()
+
+def _applyNumberProcessingEnglish(text: str, mode: int) -> str:
+    if not text or mode <= 0:
+        return text
+
+    def repl(m: "re.Match[str]") -> str:
+        tok = m.group(0)
+        if "," in tok and not _validCommaNumberRe.match(tok):
+            return tok
+        digits = tok.replace(",", "")
+        # Keep things that look like IDs (leading zeros).
+        if len(digits) > 1 and digits.startswith("0"):
+            return tok
+        try:
+            n = int(digits)
+        except Exception:
+            return tok
+        if mode == 1 and n < 10000:
+            return tok
+        # Avoid massive output for extremely large numbers.
+        if n >= 10**21:
+            return tok
+        return _intToWordsEn(n)
+
+    return _numberTokenRe.sub(repl, text)
+
+def _sanitizeText(s: str) -> str:
+    if not s: return ""
+    s = s.translate(_PUNCT_TRANSLATE)
+    for ch in _STRIP_CHARS: s = s.replace(ch, "")
+    s = _control_re.sub(" ", s)
+    s = "".join((c if ord(c) <= 0xFFFF else " ") for c in s)
+    s = " ".join(s.split())
+    return s.strip()
+
+
+# --- Enum Definitions ---
+variants = OrderedDict()
+def _v(_id, label): variants[str(_id)] = VoiceInfo(str(_id), label)
+_v(0, "Male"); _v(1, "Female"); _v(2, "Large Male"); _v(3, "Child"); _v(4, "Giant Male")
+_v(5, "Mellow Female"); _v(6, "Mellow Male"); _v(7, "Crisp Male"); _v(8, "The Fly")
+_v(9, "Robotoid"); _v(10, "Martian"); _v(11, "Colossus"); _v(12, "Fast Fred")
+_v(13, "Old Woman"); _v(14, "Munchkin"); _v(15, "Troll"); _v(16, "Nerd")
+_v(17, "Milktoast"); _v(18, "Tipsy"); _v(19, "Choirboy")
+
+intstyles = OrderedDict()
+def _i(_id, label): intstyles[str(_id)] = VoiceInfo(str(_id), label)
+_i(0, "normal1"); _i(1, "normal2"); _i(2, "monotone"); _i(3, "sung"); _i(4, "random")
+
+vmodes = OrderedDict()
+def _m(_id, label): vmodes[str(_id)] = VoiceInfo(str(_id), label)
+_m(0, "normal"); _m(1, "breathy"); _m(2, "whispered")
+
+genders = OrderedDict()
+def _g(_id, label): genders[str(_id)] = VoiceInfo(str(_id), label)
+_g(0, "male"); _g(1, "female"); _g(2, "child"); _g(3, "giant")
+
+glots = OrderedDict()
+def _t(_id, label): glots[str(_id)] = VoiceInfo(str(_id), label)
+_t(0, "default"); _t(1, "male"); _t(2, "female"); _t(3, "child")
+_t(4, "high"); _t(5, "mellow"); _t(6, "impulse"); _t(7, "odd"); _t(8, "colossus")
+
+smodes = OrderedDict()
+def _k(_id, label): smodes[str(_id)] = VoiceInfo(str(_id), label)
+_k(0, "Natural"); _k(1, "Word-at-a-time"); _k(2, "Spelled")
+
+numprocs = OrderedDict()
+def _np(_id, label): numprocs[str(_id)] = VoiceInfo(str(_id), label)
+_np(0, "Off")
+_np(1, "Large numbers (>= 10000)")
+_np(2, "All numbers")
+
+
+class SynthDriver(SynthDriver):
+    name = "sv"
+    description = "SoftVoice (nvwave)"
+    supportedSettings = (
+        SynthDriver.RateSetting(), SynthDriver.VariantSetting(),
+        SynthDriver.VoiceSetting(), SynthDriver.PitchSetting(),
+        SynthDriver.InflectionSetting(),
+        NumericDriverSetting("perturb", "Perturbation"),
+        NumericDriverSetting("vfactor", "Vowel Factor"),
+        NumericDriverSetting("avbias", "Voicing Gain"),
+        NumericDriverSetting("afbias", "Frication Gain"),
+        NumericDriverSetting("ahbias", "Aspiration Gain"),
+        DriverSetting("intstyle", "Intonation Style"),
+        DriverSetting("vmode", "Voicing Mode"),
+        DriverSetting("gender", "Gender"),
+        DriverSetting("glot", "Glottal Source"),
+        DriverSetting("smode", "Speaking Mode"),
+        BooleanDriverSetting("useAbbreviations", "Use abbreviations"),
+        DriverSetting("numproc", "Number processing"),
+        NumericDriverSetting("pauseFactor", "Pause factor"),
+    )
+    supportedCommands = {IndexCommand}
+    supportedNotifications = {synthIndexReached, synthDoneSpeaking}
+    availableVoices = OrderedDict(
+        (str(index + 1), VoiceInfo(str(index + 1), name, language))
+        for index, (name, language) in enumerate([("English", "en"), ("Spanish", "es")])
+    )
+
+    @classmethod
+    def check(cls):
+        return _softvoice.check()
+
+    def __init__(self):
+        super().__init__()
+
+        _softvoice.initialize()
+
+        # _DllProxy routes sv_set*(handle, value) calls to _softvoice.dll_call()
+        # so all existing setter code works unchanged.
+        class _DllProxy:
+            def __getattr__(self, name):
+                def _call(handle, value):
+                    _softvoice.dll_call(name, value)
+                return _call
+        self._dll = _DllProxy()
+        self._handle = True  # truthy dummy; actual handle is in _softvoice
+
+        self._hasPauseFactor = _softvoice.has_pause_factor()
+        self._hasTrimSilence = _softvoice.has_trim_silence()
+
+        self.speaking = False
+        self._terminating = False
+
+        self._bgQueue = queue.Queue()
+        self._bgStop = threading.Event()
+        self._bgThread = _BgThread(self._bgQueue, self._bgStop)
+        self._bgThread.start()
+
+        self._ratePercent = 50
+        self._pitchPercent = 50
+        self._inflectionPercent = 50
+        self._perturbPercent = 0
+        self._vfactorPercent = 20
+        self._avbiasPercent = 50
+        self._afbiasPercent = 50
+        self._ahbiasPercent = 50
+        self._pauseFactorPercent = 50
+        self._useAbbreviations = True
+
+        self._variant = "0"
+        self._intstyle = "0"
+        self._vmode = "0"
+        self._gender = "0"
+        self._glot = "0"
+        self._smode = "0"
+        self._numproc = "0"
+        self.curvoice = "1"
+
+        self._paramExplicit = {
+            "intstyle": False, "vmode": False, "gender": False, "glot": False,
+            "smode": False, "inflection": False, "perturb": False,
+            "vfactor": False, "avbias": False, "afbias": False, "ahbias": False,
+            "pitch": False
+        }
+
+        self._initializing = True
+        self.rate = self._ratePercent
+        self.pitch = 4
+        self.inflection = 25
+        self.perturb = self._perturbPercent
+        self.vfactor = self._vfactorPercent
+        self.avbias = self._avbiasPercent
+        self.afbias = self._afbiasPercent
+        self.ahbias = self._ahbiasPercent
+        self.voice = self.curvoice
+        self.pauseFactor = self._pauseFactorPercent
+        self._initializing = False
+
+
+    def _getCapPitchChangePercent(self) -> int:
+        """Return NVDA's per-synth 'Capital pitch change percentage' (-100..100)."""
+        try:
+            import config
+            v = int(config.conf["speech"][self.name].get("capPitchChange", 0))
+        except Exception:
+            try:
+                import config
+                v = int(config.conf["speech"].get("capPitchChange", 0))
+            except Exception:
+                v = 0
+        if v < -100: v = -100
+        elif v > 100: v = 100
+        return v
+
+    def _enqueue(self, func, *args, **kwargs):
+        if not self._terminating: self._bgQueue.put((func, args, kwargs))
+
+    def terminate(self):
+        self._terminating = True
+        self.cancel()
+        try:
+            self._bgStop.set()
+            self._bgQueue.put(None)
+            self._bgThread.join(timeout=2.0)
+        except: pass
+        _softvoice.terminate()
+        self._handle = None
+        self._dll = None
+
+    def cancel(self):
+        self.speaking = False
+        _softvoice.stop()
+        try:
+            while True:
+                self._bgQueue.get_nowait()
+                self._bgQueue.task_done()
+        except queue.Empty: pass
+
+    def pause(self, switch):
+        _softvoice.pause(switch)
+
+    # --- Speaking ---
+    def _buildBlocks(self, speechSequence):
+        blocks = []
+        textBuf = []
+        pendingIndexes = []
+        def flush():
+            raw = " ".join(textBuf)
+            textBuf.clear()
+            safe = self._softVoiceSafeText(raw)
+            blocks.append((safe, pendingIndexes.copy()))
+            pendingIndexes.clear()
+        for item in speechSequence:
+            if isinstance(item, str): textBuf.append(item)
+            elif isinstance(item, IndexCommand): pendingIndexes.append(item.index)
+        if textBuf or pendingIndexes: flush()
+        while blocks and (not blocks[-1][0]) and (not blocks[-1][1]): blocks.pop()
+        anyText = any(bool(t) for (t, _) in blocks)
+        allIndexes = []
+        for (_, idxs) in blocks: allIndexes.extend(idxs)
+        return blocks, anyText, allIndexes
+
+    def _notifyIndexesAndDone(self, indexes):
+        for i in indexes: synthIndexReached.notify(synth=self, index=i)
+        synthDoneSpeaking.notify(synth=self)
+        self.speaking = False
+
+    def speak(self, speechSequence):
+        if len(speechSequence) == 1 and isinstance(speechSequence[0], IndexCommand):
+            self._enqueue(self._notifyIndexesAndDone, [speechSequence[0].index])
+            return
+        blocks, anyText, allIndexes = self._buildBlocks(speechSequence)
+        if not anyText:
+            self._enqueue(self._notifyIndexesAndDone, allIndexes)
+            return
+        self._enqueue(self._speakBg, blocks)
+
+    def _speakBg(self, blocks):
+        self.speaking = True
+        is_word_mode = (str(self._smode) == "1")
+        basePitch = int(getattr(self, "_pitchPercent", 50))
+        capDelta = self._getCapPitchChangePercent()
+        applyUserPitch = (self._variant == "0" or self._paramExplicit.get("pitch", False))
+        appliedPitch = None
+        def applyPitchPercent(pct: int):
+            nonlocal appliedPitch
+            pct = self._clampPercent(pct)
+            if appliedPitch == pct or not getattr(self, "_handle", None):
+                return
+            try:
+                self._dll.sv_setPitch(self._handle, self._percentToParam(pct, 10, 2000))
+                appliedPitch = pct
+            except Exception:
+                pass
+        if applyUserPitch:
+            applyPitchPercent(basePitch)
+        for (text, indexesAfter) in blocks:
+            if not self.speaking: break
+            if text:
+                text_segments = text.split(" ") if is_word_mode else [text[i : i + MAX_STRING_LENGTH] for i in range(0, len(text), MAX_STRING_LENGTH)]
+                for seg in text_segments:
+                    if not self.speaking: break
+                    seg = seg.strip()
+                    if not seg: continue
+                    if applyUserPitch:
+                        desiredPitch = basePitch
+                        if capDelta and len(seg) == 1 and ('A' <= seg <= 'Z'):
+                            desiredPitch = basePitch + capDelta
+                        applyPitchPercent(desiredPitch)
+                    if not _softvoice.speak(seg): self.speaking = False; break
+                    if applyUserPitch:
+                        applyPitchPercent(basePitch)
+            if self.speaking:
+                def cb(idxs=indexesAfter):
+                    if self.speaking:
+                        for i in idxs: synthIndexReached.notify(synth=self, index=i)
+                _softvoice.feed_marker(on_done=cb)
+        if not self.speaking: synthDoneSpeaking.notify(synth=self); return
+        def doneCb():
+            if self.speaking: self.speaking = False; synthDoneSpeaking.notify(synth=self)
+        _softvoice.feed_marker(on_done=doneCb); _softvoice.player_idle()
+
+    def _softVoiceSafeText(self, s: str) -> str:
+        s = _sanitizeText(s)
+        if not s: return ""
+        if self._pauseFactorPercent < 50:
+            s = _labelColonRe.sub(r"\1 \2", s); s = _labelSemiRe.sub(r"\1 \2", s)
+        # Optional acronym handling: if disabled, spell short ALL-CAPS words (2-5 letters).
+        if (not bool(getattr(self, "_useAbbreviations", True))) and str(getattr(self, "_smode", "0")) != "2":
+            s = _applyAcronymSpacing(s)
+
+        # Optional number expansion (helps when SoftVoice spells long digit runs).
+        try: numMode = int(getattr(self, "_numproc", "0") or 0)
+        except Exception: numMode = 0
+        if numMode and str(getattr(self, "curvoice", "1")) == "1" and str(getattr(self, "_smode", "0")) != "2":
+            s = _applyNumberProcessingEnglish(s, numMode)
+
+        if str(getattr(self, "_smode", "0")) == "2":
+            def _spellMatch(m): return " ".join(list(m.group(0)))
+            s = _spellWordRe.sub(_spellMatch, s)
+        return " ".join(s.split()).strip()
+
+    # --- Settings ---
+    def _percentToParam(self, val, minVal, maxVal):
+        ratio = float(val) / 100.0
+        return int(round(minVal + (maxVal - minVal) * ratio))
+    def _clampPercent(self, v): return max(0, min(100, int(v)))
+
+    # Timbre Settings (protected)
+    def _timbre_setter(self, name, func, minV, maxV, val):
+        self._clampPercent(val)
+        current = getattr(self, f"_{name}Percent")
+        new_val = int(val)
+        if getattr(self, "_initializing", False):
+            setattr(self, f"_{name}Percent", new_val)
+            return
+        if self._variant != "0" and not self._paramExplicit[name]:
+             setattr(self, f"_{name}Percent", new_val)
+             if new_val != current:
+                 self._paramExplicit[name] = True
+                 if self._handle: getattr(self._dll, func)(self._handle, self._percentToParam(new_val, minV, maxV))
+             return
+        setattr(self, f"_{name}Percent", new_val)
+        self._paramExplicit[name] = True
+        if self._handle: getattr(self._dll, func)(self._handle, self._percentToParam(new_val, minV, maxV))
+
+    def _get_rate(self): return int(self._ratePercent)
+    def _set_rate(self, v):
+        self._ratePercent = self._clampPercent(v)
+        if self._handle: self._dll.sv_setRate(self._handle, self._percentToParam(self._ratePercent, 20, 500))
+
+    def _get_pitch(self): return int(self._pitchPercent)
+    def _set_pitch(self, v):
+        new_val = self._clampPercent(v)
+        current = int(getattr(self, "_pitchPercent", 50))
+
+        if getattr(self, "_initializing", False):
+            self._pitchPercent = new_val
+            return
+
+        # For custom voices, don't override the personality's own pitch unless the user
+        # actually changes the slider while on that voice.
+        if self._variant != "0" and not self._paramExplicit.get("pitch", False):
+            self._pitchPercent = new_val
+            if new_val != current:
+                self._paramExplicit["pitch"] = True
+                if self._handle:
+                    try:
+                        self._dll.sv_setPitch(self._handle, self._percentToParam(new_val, 10, 2000))
+                    except Exception:
+                        pass
+            return
+
+        self._pitchPercent = new_val
+        self._paramExplicit["pitch"] = True
+        if self._handle:
+            try:
+                self._dll.sv_setPitch(self._handle, self._percentToParam(new_val, 10, 2000))
+            except Exception:
+                pass
+
+    def _get_inflection(self): return int(self._inflectionPercent)
+    def _set_inflection(self, v): self._timbre_setter("inflection", "sv_setF0Range", 0, 500, v)
+    def _get_perturb(self): return int(self._perturbPercent)
+    def _set_perturb(self, v): self._timbre_setter("perturb", "sv_setF0Perturb", 0, 500, v)
+    def _get_vfactor(self): return int(self._vfactorPercent)
+    def _set_vfactor(self, v): self._timbre_setter("vfactor", "sv_setVowelFactor", 0, 500, v)
+    def _get_avbias(self): return int(self._avbiasPercent)
+    def _set_avbias(self, v): self._timbre_setter("avbias", "sv_setAVBias", -50, 50, v)
+    def _get_afbias(self): return int(self._afbiasPercent)
+    def _set_afbias(self, v): self._timbre_setter("afbias", "sv_setAFBias", -50, 50, v)
+    def _get_ahbias(self): return int(self._ahbiasPercent)
+    def _set_ahbias(self, v): self._timbre_setter("ahbias", "sv_setAHBias", -50, 50, v)
+
+    def _get_pauseFactor(self): return int(self._pauseFactorPercent)
+    def _set_pauseFactor(self, v):
+        self._pauseFactorPercent = self._clampPercent(v)
+        if self._handle:
+            if self._hasPauseFactor:
+                inverted = 100 - int(self._pauseFactorPercent)
+                try: self._dll.sv_setPauseFactor(self._handle, inverted)
+                except: pass
+            if self._hasTrimSilence:
+                try: self._dll.sv_setTrimSilence(self._handle, 1 if self._pauseFactorPercent < 50 else 0)
+                except: pass
+
+    def _get_availableVariants(self): return variants
+    def _get_variant(self): return getattr(self, "_variant", "0")
+    def _set_variant(self, _id):
+        new_v = str(_id)
+        prev_v = getattr(self, "_variant", "0")
+        self._variant = new_v
+
+        # Switching personality should clear "explicit override" flags so that custom
+        # voices come up with their own defaults unless the user tweaks a knob.
+        if prev_v != new_v:
+            for k in self._paramExplicit:
+                self._paramExplicit[k] = False
+
+        if self._handle:
+            try:
+                self._dll.sv_setPersonality(self._handle, int(_id))
+
+                # Baseline (Male): re-assert the user's numeric sliders after a personality change.
+                if new_v == "0":
+                    self._dll.sv_setRate(self._handle, self._percentToParam(self._ratePercent, 20, 500))
+                    self._dll.sv_setPitch(self._handle, self._percentToParam(self._pitchPercent, 10, 2000))
+                    self._dll.sv_setF0Range(self._handle, self._percentToParam(self._inflectionPercent, 0, 500))
+                    self._dll.sv_setF0Perturb(self._handle, self._percentToParam(self._perturbPercent, 0, 500))
+                    self._dll.sv_setVowelFactor(self._handle, self._percentToParam(self._vfactorPercent, 0, 500))
+                    self._dll.sv_setAVBias(self._handle, self._percentToParam(self._avbiasPercent, -50, 50))
+                    self._dll.sv_setAFBias(self._handle, self._percentToParam(self._afbiasPercent, -50, 50))
+                    self._dll.sv_setAHBias(self._handle, self._percentToParam(self._ahbiasPercent, -50, 50))
+            except Exception:
+                pass
+
+    def _get_voice(self): return getattr(self, "curvoice", "1")
+    def _set_voice(self, v):
+        self.curvoice = str(v)
+        if self._handle: self._dll.sv_setVoice(self._handle, int(v))
+
+    def _set_enum_generic(self, attr_name, func_name, val_id):
+        key = attr_name.strip("_")
+        val = int(val_id)
+        current = int(getattr(self, attr_name, 0))
+        setattr(self, attr_name, str(val_id))
+        if not self._paramExplicit.get(key, False):
+            if self._variant == "0" and val == current:
+                return
+            if self._variant != "0":
+                self._paramExplicit[key] = True
+                if self._handle: getattr(self._dll, func_name)(self._handle, val)
+                return
+        self._paramExplicit[key] = True
+        if self._handle: getattr(self._dll, func_name)(self._handle, val)
+
+    def _get_availableNumprocs(self): return numprocs
+    def _get_useAbbreviations(self):
+        # When enabled, we let SoftVoice handle abbreviations/acronyms normally.
+        # When disabled, we insert spaces into short ALL-CAPS words (e.g. NVDA -> N V D A)
+        # to prevent unwanted expansions like "Nevada access".
+        return bool(getattr(self, "_useAbbreviations", True))
+
+    def _set_useAbbreviations(self, v):
+        if isinstance(v, str):
+            vv = v.strip().lower()
+            self._useAbbreviations = vv in ("1", "true", "yes", "on")
+            return
+        try:
+            self._useAbbreviations = bool(int(v))
+        except Exception:
+            self._useAbbreviations = bool(v)
+
+    def _get_numproc(self): return getattr(self, "_numproc", "0")
+    def _set_numproc(self, v): self._numproc = str(v)
+
+    def _get_availableIntstyles(self): return intstyles
+    def _get_intstyle(self): return getattr(self, "_intstyle", "0")
+    def _set_intstyle(self, v): self._set_enum_generic("_intstyle", "sv_setF0Style", v)
+    def _get_availableVmodes(self): return vmodes
+    def _get_vmode(self): return getattr(self, "_vmode", "0")
+    def _set_vmode(self, v): self._set_enum_generic("_vmode", "sv_setVoicingMode", v)
+    def _get_availableGenders(self): return genders
+    def _get_gender(self): return getattr(self, "_gender", "0")
+    def _set_gender(self, v): self._set_enum_generic("_gender", "sv_setGender", v)
+    def _get_availableGlots(self): return glots
+    def _get_glot(self): return getattr(self, "_glot", "0")
+    def _set_glot(self, v): self._set_enum_generic("_glot", "sv_setGlottalSource", v)
+    def _get_availableSmodes(self): return smodes
+    def _get_smode(self): return getattr(self, "_smode", "0")
+    def _set_smode(self, v): self._set_enum_generic("_smode", "sv_setSpeakingMode", v)

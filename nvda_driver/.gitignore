@@ -1,0 +1,5 @@
+*.dll
+*.exe
+*.nvda-addon
+build/
+__pycache__/
