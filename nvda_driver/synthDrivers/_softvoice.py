@@ -167,7 +167,25 @@ class SoftVoiceDirectClient:
 		self._out_value = None
 
 	def do_initialize(self, dll_path: str, tibase_path: str, initial_voice: int) -> Dict[str, Any]:
-		"""Load the wrapper DLL and initialize the engine."""
+		"""Load the wrapper DLL and initialize the engine.
+
+		The SoftVoice engine (tibase32.dll) cannot survive a
+		FreeLibrary/LoadLibrary cycle, so we keep the DLL and engine
+		handle alive for the entire NVDA process and only re-create
+		the Python-side audio plumbing on each init.
+		"""
+		if self._handle:
+			# Engine still alive from a previous init — reuse it.
+			return {
+				"format": {
+					"sampleRate": self._sample_rate,
+					"channels": self._channels,
+					"bitsPerSample": self._bits_per_sample,
+				},
+				"hasPauseFactor": self._has_pause_factor,
+				"hasTrimSilence": self._has_trim_silence,
+			}
+
 		if self._dll is None:
 			self._dll = ctypes.cdll.LoadLibrary(dll_path)
 			self._setup_ctypes()
@@ -374,16 +392,9 @@ class SoftVoiceDirectClient:
 			if self._player:
 				self._player.close()
 				self._player = None
-		if self._handle and self._dll:
-			try:
-				self._dll.sv_free(self._handle)
-			except Exception:
-				LOGGER.exception("sv_free failed")
-			self._handle = None
-		# Reset audio state for re-initialization.
-		# Keep self._dll alive — the wrapper DLL stays loaded so that
-		# MinHook trampolines remain valid, but sv_free's force-unload
-		# ensures the engine DLLs (tibase32 etc.) are fully released.
+		# Do NOT call sv_free — the SoftVoice engine cannot be
+		# re-initialized after teardown.  Keep the DLL and handle
+		# alive; the OS reclaims everything when NVDA exits.
 		self._audio_queue = queue.Queue()
 		self._sequence = 0
 		self._current_seq = 0
@@ -514,10 +525,11 @@ if IS_64BIT:
 				msg_type = message.get("type")
 				if msg_type == "response":
 					msg_id = message["id"]
-					self._responses[msg_id] = message
 					event = self._pending.pop(msg_id, None)
 					if event:
+						self._responses[msg_id] = message
 						event.set()
+					# else: fire-and-forget command — discard response
 				elif msg_type == "event":
 					self._handle_event(message["event"], message.get("payload", {}))
 				else:
@@ -721,10 +733,24 @@ def speak(text: str) -> bool:
 
 
 def dll_call(func_name: str, value: int) -> None:
-	"""Call a sv_set* function by name (parameter setters)."""
+	"""Call a sv_set* function by name (parameter setters).
+
+	On 64-bit, this is fire-and-forget: the host-side handler is an
+	atomic store via ctypes that cannot fail or block, so we don't wait
+	for a response.  This avoids deadlocking with the speak thread
+	which may be holding _send_lock while flushing audio events.
+	"""
 	if IS_64BIT:
+		if not _client._host:
+			return
 		try:
-			_client.send_command("dllCall", funcName=func_name, value=value)
+			msg_id = next(_client._id_counter)
+			with _client._send_lock:
+				_client._host.connection.send({
+					"type": "command", "id": msg_id,
+					"command": "dllCall",
+					"payload": {"funcName": func_name, "value": value},
+				})
 		except Exception:
 			LOGGER.exception("dllCall %s failed", func_name)
 	else:
