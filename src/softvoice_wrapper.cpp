@@ -1554,9 +1554,8 @@ extern "C" SV_API SV_STATE* __cdecl sv_initW(const wchar_t* baseDllPath, int ini
         if (s->stopEvent) CloseHandle(s->stopEvent);
         if (s->cmdEvent) CloseHandle(s->cmdEvent);
 
-        if (s->spanModule) FreeLibrary(s->spanModule);
-        if (s->engModule) FreeLibrary(s->engModule);
-        if (s->baseModule) FreeLibrary(s->baseModule);
+        { auto fl = [](HMODULE& m) { if (!m) return; while (FreeLibrary(m)) {} m = nullptr; };
+          fl(s->spanModule); fl(s->engModule); fl(s->baseModule); }
 
         if (g_state == s) g_state = nullptr;
         delete s;
@@ -1611,9 +1610,22 @@ extern "C" SV_API void __cdecl sv_free(SV_STATE* s) {
     if (s->stopEvent) CloseHandle(s->stopEvent);
     if (s->cmdEvent) CloseHandle(s->cmdEvent);
 
-    if (s->spanModule) FreeLibrary(s->spanModule);
-    if (s->engModule) FreeLibrary(s->engModule);
-    if (s->baseModule) FreeLibrary(s->baseModule);
+    // Force-unload the SoftVoice engine DLLs by draining any extra
+    // LoadLibrary references.  tibase32.dll is a late-90s engine that
+    // keeps internal global state which is NOT reset by SVCloseSpeech.
+    // A single FreeLibrary may leave the DLL mapped (refcount > 0) if
+    // the engine or its dependencies called LoadLibrary internally.
+    // Looping until the module is truly gone ensures a future sv_initW
+    // gets a pristine DLL_PROCESS_ATTACH.
+    auto forceUnload = [](HMODULE& mod) {
+        if (!mod) return;
+        // FreeLibrary returns FALSE once the module is already gone.
+        while (FreeLibrary(mod)) {}
+        mod = nullptr;
+    };
+    forceUnload(s->spanModule);
+    forceUnload(s->engModule);
+    forceUnload(s->baseModule);
 
     if (g_state == s) g_state = nullptr;
     delete s;
