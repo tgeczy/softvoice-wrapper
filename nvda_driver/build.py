@@ -28,13 +28,13 @@ ADDON_FILES = {
 	# Locale
 	"locale/ru/manifest.ini": os.path.join(ADDON_DIR, "locale", "ru", "manifest.ini"),
 
-	# SynthDriver Python files
+	# SynthDriver Python files. This set mirrors the tested working install:
+	# the driver runs through NVDA's synthDriverHost32 bridge (2026.1+); the
+	# _host/_sv_ipc pair supports the pre-bridge fallback path.
 	"synthDrivers/sv.py": os.path.join(SYNTH_DIR, "sv.py"),
 	"synthDrivers/_softvoice.py": os.path.join(SYNTH_DIR, "_softvoice.py"),
+	"synthDrivers/_host_softvoice32.py": os.path.join(SYNTH_DIR, "_host_softvoice32.py"),
 	"synthDrivers/_sv_ipc.py": os.path.join(SYNTH_DIR, "_sv_ipc.py"),
-
-	# 32-bit host executable
-	"synthDrivers/softvoice_host32.exe": os.path.join(SYNTH_DIR, "softvoice_host32.exe"),
 
 	# 32-bit wrapper DLL
 	"synthDrivers/softvoice_wrapper.dll": os.path.join(SYNTH_DIR, "softvoice_wrapper.dll"),
@@ -42,10 +42,6 @@ ADDON_FILES = {
 	# Engine DLLs
 	"synthDrivers/tibase32.dll": os.path.join(SYNTH_DIR, "tibase32.dll"),
 	"synthDrivers/tieng32.dll": os.path.join(SYNTH_DIR, "tieng32.dll"),
-	"synthDrivers/svctl32.dll": os.path.join(SYNTH_DIR, "svctl32.dll"),
-	"synthDrivers/sveng32.dll": os.path.join(SYNTH_DIR, "sveng32.dll"),
-	"synthDrivers/svctl64.dll": os.path.join(SYNTH_DIR, "svctl64.dll"),
-	"synthDrivers/sveng64.dll": os.path.join(SYNTH_DIR, "sveng64.dll"),
 	"synthDrivers/TISPAN32.DLL": os.path.join(SYNTH_DIR, "TISPAN32.DLL"),
 }
 
@@ -63,8 +59,7 @@ def main():
 		print()
 
 	# Only require the Python files and manifest to exist
-	required = ["manifest.ini", "synthDrivers/sv.py", "synthDrivers/_softvoice.py",
-				"synthDrivers/_sv_ipc.py"]
+	required = ["manifest.ini", "synthDrivers/sv.py", "synthDrivers/_softvoice.py"]
 	for r in required:
 		if r in [m[0] for m in missing]:
 			print(f"ERROR: Required file missing: {r}")

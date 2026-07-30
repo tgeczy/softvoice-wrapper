@@ -1,4 +1,4 @@
-"""32-bit host process for SoftVoice speech synthesis.
+﻿"""32-bit host process for SoftVoice speech synthesis.
 
 This module runs as a separate 32-bit Python process.  It loads the
 softvoice_wrapper.dll (which in turn loads the 32-bit tibase32.dll)
@@ -14,10 +14,11 @@ import argparse
 import ctypes
 import logging
 import os
+import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import _sv_ipc as _ipc
 
@@ -57,8 +58,8 @@ class HostConfig:
 class SoftVoiceRuntime:
 	"""Wraps access to the 32-bit softvoice_wrapper.dll."""
 
-	def __init__(self, conn: _ipc.IpcConnection, config: HostConfig):
-		self._conn = conn
+	def __init__(self, send_func: Callable[[dict], None], config: HostConfig):
+		self._send_func = send_func
 		self._config = config
 		self._dll = None
 		self._handle = None
@@ -75,7 +76,7 @@ class SoftVoiceRuntime:
 
 	def _send_event(self, event: str, **payload: object) -> None:
 		try:
-			self._conn.send({"type": "event", "event": event, "payload": payload})
+			self._send_func({"type": "event", "event": event, "payload": payload})
 		except Exception:
 			LOGGER.exception("Failed to send event %s", event)
 
@@ -166,7 +167,12 @@ class SoftVoiceRuntime:
 		self._read_loop()
 
 	def _read_loop(self) -> None:
-		"""Pull items from the wrapper and push them as events to the client."""
+		"""Pull items from the wrapper and queue them as events.
+
+		Because _send_event uses a queue (never blocks), this loop
+		always checks _should_stop promptly â€” unlike a direct TCP
+		sendall() which could block indefinitely.
+		"""
 		while not self._should_stop:
 			try:
 				n = self._dll.sv_read(
@@ -201,7 +207,6 @@ class SoftVoiceRuntime:
 		self._should_stop = True
 		if self._handle:
 			self._dll.sv_stop(self._handle)
-		self._send_event("stopped")
 
 	def dll_call(self, func_name: str, value: int) -> None:
 		"""Call a whitelisted sv_set* function."""
@@ -229,8 +234,11 @@ class SoftVoiceRuntime:
 class HostController:
 	"""Receives commands from the 64-bit NVDA client and dispatches them.
 
-	Speech commands run in a worker thread so that the main recv loop
-	remains responsive to stop commands.
+	All TCP sends are funnelled through a dedicated sender thread so
+	that the main recv loop and speak threads never block on socket
+	I/O.  This prevents the deadlock where the speak thread holds the
+	IPC send-lock during sendall() and the main thread can't send
+	responses or receive new commands.
 	"""
 
 	def __init__(self, conn: _ipc.IpcConnection):
@@ -238,6 +246,15 @@ class HostController:
 		self._runtime: Optional[SoftVoiceRuntime] = None
 		self._should_exit = False
 		self._speak_thread: Optional[threading.Thread] = None
+		self._speak_gen = 0  # incremented on each speak; old threads bail
+		# Send queue: all outgoing messages go through here so that
+		# neither the main recv loop nor the speak thread ever blocks
+		# on TCP sendall().
+		self._send_queue: queue.Queue = queue.Queue()
+		self._drop_audio = False
+		self._sender_thread = threading.Thread(
+			target=self._sender_loop, daemon=True, name="HostSender")
+		self._sender_thread.start()
 		self._handlers = {
 			"initialize": self._handle_initialize,
 			"speak": self._handle_speak,
@@ -246,6 +263,30 @@ class HostController:
 			"getFormat": self._handle_get_format,
 			"delete": self._handle_delete,
 		}
+
+	def _queue_send(self, msg: dict) -> None:
+		"""Put a message on the send queue (never blocks)."""
+		self._send_queue.put(msg)
+
+	def _sender_loop(self) -> None:
+		"""Dedicated thread that drains the send queue over TCP."""
+		while True:
+			try:
+				msg = self._send_queue.get()
+			except Exception:
+				break
+			if msg is None:
+				break
+			# Drop audio events when stop is active
+			if (self._drop_audio
+					and msg.get("type") == "event"
+					and msg.get("event") == "audio"):
+				continue
+			try:
+				self._conn.send(msg)
+			except Exception:
+				LOGGER.exception("Sender thread: send failed")
+				break
 
 	def serve_forever(self) -> None:
 		LOGGER.info("Host controller waiting for commands")
@@ -267,34 +308,56 @@ class HostController:
 			handler = self._handlers.get(command)
 			if handler is None:
 				LOGGER.error("Unknown command %s", command)
-				self._conn.send({"type": "response", "id": msg_id, "error": "unknownCommand"})
+				self._queue_send({"type": "response", "id": msg_id, "error": "unknownCommand"})
 				continue
 
 			if command == "speak":
-				self._wait_for_speak_thread()
+				# Launch speak in a background thread.  A generation
+				# counter ensures superseded threads bail immediately.
+				self._speak_gen += 1
+				gen = self._speak_gen
+				self._drop_audio = False  # allow audio for new speak
+				prev_thread = self._speak_thread
 				self._speak_thread = threading.Thread(
-					target=self._run_blocking_handler,
-					args=(msg_id, handler, message.get("payload", {})),
+					target=self._run_speak_thread,
+					args=(msg_id, handler, message.get("payload", {}), prev_thread, gen),
 					daemon=True,
 				)
 				self._speak_thread.start()
 			else:
 				try:
 					payload = handler(**message.get("payload", {}))
-					self._conn.send({"type": "response", "id": msg_id, "payload": payload or {}})
+					self._queue_send({"type": "response", "id": msg_id, "payload": payload or {}})
 					if command == "delete" and self._should_exit:
 						break
 				except Exception as exc:
 					LOGGER.exception("Command %s failed", command)
-					self._conn.send({"type": "response", "id": msg_id, "error": str(exc)})
+					self._queue_send({"type": "response", "id": msg_id, "error": str(exc)})
+		# Shut down the sender thread
+		self._send_queue.put(None)
+		self._sender_thread.join(timeout=3)
 
-	def _run_blocking_handler(self, msg_id: int, handler, payload: Dict[str, Any]) -> None:
+	def _run_speak_thread(self, msg_id: int, handler, payload: Dict[str, Any],
+						  prev_thread: Optional[threading.Thread],
+						  gen: int) -> None:
+		"""Run a speak command, waiting briefly for any previous speak."""
+		# If a newer speak already arrived, this one is stale â€” bail.
+		if gen != self._speak_gen:
+			self._queue_send({"type": "response", "id": msg_id, "payload": {"status": "cancelled"}})
+			return
+		# Wait briefly for the old thread; give up quickly.
+		if prev_thread and prev_thread.is_alive():
+			prev_thread.join(timeout=2)
+		# Check again after the wait.
+		if gen != self._speak_gen:
+			self._queue_send({"type": "response", "id": msg_id, "payload": {"status": "cancelled"}})
+			return
 		try:
 			result = handler(**payload)
-			self._conn.send({"type": "response", "id": msg_id, "payload": result or {}})
+			self._queue_send({"type": "response", "id": msg_id, "payload": result or {}})
 		except Exception as exc:
 			LOGGER.exception("Blocking command failed")
-			self._conn.send({"type": "response", "id": msg_id, "error": str(exc)})
+			self._queue_send({"type": "response", "id": msg_id, "error": str(exc)})
 
 	# ------------------------------------------------------------------
 	# Command handlers
@@ -305,7 +368,7 @@ class HostController:
 			tibase_path=tibasePath,
 			initial_voice=initialVoice,
 		)
-		self._runtime = SoftVoiceRuntime(self._conn, config)
+		self._runtime = SoftVoiceRuntime(self._queue_send, config)
 		return self._runtime.start()
 
 	def _handle_speak(self, text: str, **_kw) -> Dict:
@@ -313,9 +376,9 @@ class HostController:
 		return {"status": "ok"}
 
 	def _handle_stop(self, **_kw) -> Dict:
+		self._drop_audio = True  # tell sender to skip pending audio
 		if self._runtime:
 			self._runtime.stop()
-		self._wait_for_speak_thread()
 		return {"status": "ok"}
 
 	def _handle_dll_call(self, funcName: str, value: int, **_kw) -> Dict:
@@ -326,16 +389,15 @@ class HostController:
 		return self._runtime.get_format()
 
 	def _handle_delete(self, **_kw) -> Dict:
-		self._wait_for_speak_thread()
+		self._drop_audio = True
+		if self._runtime:
+			self._runtime.stop()
+		if self._speak_thread and self._speak_thread.is_alive():
+			self._speak_thread.join(timeout=2)
 		if self._runtime:
 			self._runtime.delete()
 		self._should_exit = True
 		return {"status": "ok"}
-
-	def _wait_for_speak_thread(self) -> None:
-		if self._speak_thread and self._speak_thread.is_alive():
-			self._speak_thread.join(timeout=30)
-		self._speak_thread = None
 
 
 def main() -> None:

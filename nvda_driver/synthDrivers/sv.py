@@ -32,7 +32,7 @@ from autoSettingsUtils.driverSetting import DriverSetting, NumericDriverSetting,
 
 from . import _softvoice
 
-MAX_STRING_LENGTH = 1200
+MAX_STRING_LENGTH = 200
 
 # --- Background Thread ---
 class _BgThread(threading.Thread):
@@ -229,16 +229,24 @@ class SynthDriver(SynthDriver):
     )
     supportedCommands = {IndexCommand}
     supportedNotifications = {synthIndexReached, synthDoneSpeaking}
-    availableVoices = OrderedDict(
+    _availableVoices = OrderedDict(
         (str(index + 1), VoiceInfo(str(index + 1), name, language))
         for index, (name, language) in enumerate([("English", "en"), ("Spanish", "es")])
     )
+
+    def _getAvailableVoices(self):
+        return self._availableVoices
 
     @classmethod
     def check(cls):
         return _softvoice.check()
 
     def __init__(self):
+        # Ensure config.pre_configSave exists (bridge host compat)
+        import config
+        if not hasattr(config, 'pre_configSave'):
+            import extensionPoints
+            config.pre_configSave = extensionPoints.Action()
         super().__init__()
 
         _softvoice.initialize()
@@ -257,6 +265,7 @@ class SynthDriver(SynthDriver):
         self._hasTrimSilence = _softvoice.has_trim_silence()
 
         self.speaking = False
+        self._speakGeneration = 0
         self._terminating = False
 
         self._bgQueue = queue.Queue()
@@ -336,6 +345,7 @@ class SynthDriver(SynthDriver):
         self._dll = None
 
     def cancel(self):
+        self._speakGeneration += 1
         self.speaking = False
         _softvoice.stop()
         try:
@@ -384,6 +394,8 @@ class SynthDriver(SynthDriver):
         self._enqueue(self._speakBg, blocks)
 
     def _speakBg(self, blocks):
+        self._speakGeneration += 1
+        gen = self._speakGeneration
         self.speaking = True
         is_word_mode = (str(self._smode) == "1")
         basePitch = int(getattr(self, "_pitchPercent", 50))
@@ -419,13 +431,13 @@ class SynthDriver(SynthDriver):
                     if applyUserPitch:
                         applyPitchPercent(basePitch)
             if self.speaking:
-                def cb(idxs=indexesAfter):
-                    if self.speaking:
+                def cb(idxs=indexesAfter, g=gen):
+                    if self._speakGeneration == g:
                         for i in idxs: synthIndexReached.notify(synth=self, index=i)
                 _softvoice.feed_marker(on_done=cb)
         if not self.speaking: synthDoneSpeaking.notify(synth=self); return
-        def doneCb():
-            if self.speaking: self.speaking = False; synthDoneSpeaking.notify(synth=self)
+        def doneCb(g=gen):
+            if self._speakGeneration == g: self.speaking = False; synthDoneSpeaking.notify(synth=self)
         _softvoice.feed_marker(on_done=doneCb); _softvoice.player_idle()
 
     def _softVoiceSafeText(self, s: str) -> str:
@@ -532,7 +544,7 @@ class SynthDriver(SynthDriver):
                 try: self._dll.sv_setTrimSilence(self._handle, 1 if self._pauseFactorPercent < 50 else 0)
                 except: pass
 
-    def _get_availableVariants(self): return variants
+    def _getAvailableVariants(self): return variants
     def _get_variant(self): return getattr(self, "_variant", "0")
     def _set_variant(self, _id):
         new_v = str(_id)
@@ -617,3 +629,37 @@ class SynthDriver(SynthDriver):
     def _get_availableSmodes(self): return smodes
     def _get_smode(self): return getattr(self, "_smode", "0")
     def _set_smode(self, v): self._set_enum_generic("_smode", "sv_setSpeakingMode", v)
+
+
+# ---------------------------------------------------------------------------
+# 64-bit NVDA 2026.1+: use the built-in bridge to run the full driver in a
+# 32-bit host process.  Audio plays from the host directly via nvwave.
+# On 32-bit (including the bridge host), this block is skipped and the
+# SynthDriver class defined above is used as-is.
+# ---------------------------------------------------------------------------
+import ctypes as _ctypes
+if _ctypes.sizeof(_ctypes.c_void_p) == 8:
+    from _bridge.clients.synthDriverHost32.synthDriver import SynthDriverProxy32 as _Proxy32
+
+    class SynthDriver(_Proxy32):
+        name = "sv"
+        description = "SoftVoice (nvwave)"
+        synthDriver32Path = os.path.dirname(__file__)
+        synthDriver32Name = "sv"
+
+        # The bridge proxy only has _get_/_set_ for these 6 settings.
+        # Filter out everything else so the voice dialog doesn't crash.
+        _BRIDGE_SAFE = frozenset({"voice", "variant", "rate", "pitch", "volume", "rateBoost"})
+
+        def _get_supportedSettings(self):
+            return [s for s in super()._get_supportedSettings() if s.id in self._BRIDGE_SAFE]
+
+        @classmethod
+        def check(cls):
+            if not super().check():
+                return False
+            base = os.path.dirname(__file__)
+            return (
+                os.path.isfile(os.path.join(base, "softvoice_wrapper.dll"))
+                and _softvoice._find_tibase32(base) != ""
+            )

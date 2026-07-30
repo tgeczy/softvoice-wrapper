@@ -1,30 +1,18 @@
 """Client-side helper for SoftVoice speech synthesis.
 
-On 32-bit Python (NVDA 2025.3 and earlier): loads softvoice_wrapper.dll
-directly via ctypes -- no host process needed.
-
-On 64-bit Python (NVDA 2026.1+): communicates with a 32-bit host process
-over IPC so the 32-bit wrapper DLL can be used from 64-bit NVDA.
-
-Adapted from Fastfinge's Eloquence 64 project with permission.
-Original: https://github.com/Fastfinge/eloquence_64
+Loads softvoice_wrapper.dll directly via ctypes.  On 64-bit NVDA 2026.1+
+the entire synth driver (including this module) runs inside NVDA's built-in
+32-bit bridge host, so this code always operates in a 32-bit process.
 """
 from __future__ import annotations
 
 import ctypes
-import itertools
 import logging
 import os
 import queue
-import subprocess
 import threading
 import time
 from typing import Any, Callable, Dict, Optional, Tuple
-
-IS_64BIT = ctypes.sizeof(ctypes.c_void_p) == 8
-
-if IS_64BIT:
-	from . import _sv_ipc as _ipc
 
 LOGGER = logging.getLogger(__name__)
 
@@ -33,10 +21,6 @@ SV_ITEM_NONE = 0
 SV_ITEM_AUDIO = 1
 SV_ITEM_DONE = 2
 SV_ITEM_ERROR = 3
-
-HOST_EXECUTABLE = "softvoice_host32.exe"
-HOST_SCRIPT = "_host_softvoice32.py"
-AUTH_KEY_BYTES = 16
 
 # DLL setter functions allowed for dll_call
 _ALLOWED_DLL_CALLS = frozenset({
@@ -91,13 +75,38 @@ class AudioWorker(threading.Thread):
 			if chunk is None:
 				break
 
-			data, index, is_final, seq = chunk
+			data, second, is_final, seq = chunk
 
 			if seq < self._get_sequence():
 				self._queue.task_done()
 				continue
 
-			if not data and index is None:
+			# Marker callback: feed empty buffer with onDone to WavePlayer
+			if callable(second):
+				if not self._stopping:
+					try:
+						with self._player_lock:
+							if not self._stopping and self._player:
+								self._player.feed(b"", onDone=second)
+					except Exception:
+						LOGGER.exception("Marker feed failed")
+				self._queue.task_done()
+				continue
+
+			# Idle signal
+			if second == "IDLE":
+				if not self._stopping:
+					try:
+						with self._player_lock:
+							if not self._stopping and self._player:
+								self._player.idle()
+					except Exception:
+						LOGGER.exception("Player idle failed")
+				self._queue.task_done()
+				continue
+
+			# Done marker (from _read_loop)
+			if not data and second is None:
 				if is_final and self._auto_idle:
 					with self._player_lock:
 						if not self._stopping:
@@ -365,14 +374,10 @@ class SoftVoiceDirectClient:
 				self._player.pause(switch)
 
 	def feed_marker(self, on_done=None) -> None:
-		with self._player_lock:
-			if self._player:
-				self._player.feed(b"", onDone=on_done)
+		self._audio_queue.put((b"", on_done, False, self._current_seq))
 
 	def player_idle(self) -> None:
-		with self._player_lock:
-			if self._player:
-				self._player.idle()
+		self._audio_queue.put((b"", "IDLE", False, self._current_seq))
 
 	def get_format(self) -> Dict[str, int]:
 		return {
@@ -404,270 +409,12 @@ class SoftVoiceDirectClient:
 # 64-bit IPC client (communicates with 32-bit host process)
 # ---------------------------------------------------------------------------
 
-if IS_64BIT:
-	from dataclasses import dataclass
-
-	@dataclass
-	class HostProcess:
-		process: subprocess.Popen
-		connection: _ipc.IpcConnection
-		listener: Any  # socket
-
-	class SoftVoiceHostClient:
-		"""Spawns a 32-bit host process and communicates via IPC."""
-
-		def __init__(self) -> None:
-			self._host: Optional[HostProcess] = None
-			self._pending: Dict[int, threading.Event] = {}
-			self._responses: Dict[int, Dict[str, Any]] = {}
-			self._receiver: Optional[threading.Thread] = None
-			self._id_counter = itertools.count(1)
-			self._audio_queue: "queue.Queue[Optional[AudioChunk]]" = queue.Queue()
-			self._player = None
-			self._player_lock = threading.RLock()
-			self._audio_worker: Optional[AudioWorker] = None
-			self._send_lock = threading.Lock()
-			self._sequence = 0
-			self._current_seq = 0
-
-		def ensure_started(self) -> None:
-			if self._host:
-				return
-			addon_dir = os.path.abspath(os.path.dirname(__file__))
-			authkey = os.urandom(AUTH_KEY_BYTES)
-
-			listener = _ipc.create_listener()
-			port = listener.getsockname()[1]
-
-			cmd = list(self._resolve_host_executable(addon_dir))
-			cmd.extend([
-				"--address", f"127.0.0.1:{port}",
-				"--authkey", authkey.hex(),
-				"--log-dir", addon_dir,
-			])
-			LOGGER.info("Launching SoftVoice host: %s", cmd)
-			proc = subprocess.Popen(cmd, cwd=addon_dir, creationflags=subprocess.CREATE_NO_WINDOW)
-
-			conn = _ipc.accept_authenticated(listener, authkey)
-			self._host = HostProcess(process=proc, connection=conn, listener=listener)
-
-			self._receiver = threading.Thread(target=self._receiver_loop, daemon=True,
-											  name="SoftVoiceReceiver")
-			self._receiver.start()
-
-		def _resolve_host_executable(self, addon_dir: str):
-			override = os.environ.get("SOFTVOICE_HOST_COMMAND")
-			if override:
-				import shlex
-				return shlex.split(override)
-			exe_path = os.path.join(addon_dir, HOST_EXECUTABLE)
-			if os.path.exists(exe_path):
-				return [exe_path]
-			script_path = os.path.join(addon_dir, HOST_SCRIPT)
-			if os.path.exists(script_path):
-				return ["py", "-3.14-32", script_path]
-			raise RuntimeError("SoftVoice host executable not found")
-
-		def initialize_audio(self, channels: int, sample_rate: int, bits_per_sample: int) -> None:
-			if self._player:
-				return
-			import nvwave
-			import config
-			try:
-				from buildVersion import version_year
-			except ImportError:
-				version_year = 2025
-
-			# SoftVoice engine outputs 8-bit unsigned PCM at 11025 Hz.
-			# WASAPI can't handle 8-bit, so convert to 16-bit.
-			# Let WASAPI handle the 11025 Hz resampling natively.
-			convert_8to16 = (bits_per_sample == 8)
-			player_bps = 16 if convert_8to16 else bits_per_sample
-
-			if version_year >= 2025:
-				device = config.conf["audio"]["outputDevice"]
-				player = nvwave.WavePlayer(channels, sample_rate, player_bps,
-										   outputDevice=device)
-			else:
-				device = config.conf["speech"]["outputDevice"]
-				player = nvwave.WavePlayer(channels, sample_rate, player_bps,
-										   outputDevice=device, buffered=True)
-			self._player = player
-			self._audio_worker = AudioWorker(player, self._audio_queue,
-											 lambda: self._sequence,
-											 convert_8to16=convert_8to16,
-											 player_lock=self._player_lock,
-											 auto_idle=False)
-			self._audio_worker.start()
-
-		def _receiver_loop(self) -> None:
-			connection = self._host.connection if self._host else None
-			if connection is None:
-				return
-			while True:
-				try:
-					message = connection.recv()
-				except (EOFError, ConnectionAbortedError, OSError):
-					LOGGER.info("Host connection closed")
-					for msg_id, event in list(self._pending.items()):
-						self._responses[msg_id] = {"error": "connectionClosed"}
-						event.set()
-					self._pending.clear()
-					break
-				except Exception:
-					LOGGER.exception("Unexpected error in receiver loop")
-					for msg_id, event in list(self._pending.items()):
-						self._responses[msg_id] = {"error": "receiverException"}
-						event.set()
-					self._pending.clear()
-					break
-
-				msg_type = message.get("type")
-				if msg_type == "response":
-					msg_id = message["id"]
-					event = self._pending.pop(msg_id, None)
-					if event:
-						self._responses[msg_id] = message
-						event.set()
-					# else: fire-and-forget command — discard response
-				elif msg_type == "event":
-					self._handle_event(message["event"], message.get("payload", {}))
-				else:
-					LOGGER.warning("Unknown message type %s", msg_type)
-
-		def _handle_event(self, event: str, payload: Dict[str, Any]) -> None:
-			if event == "audio":
-				data = payload.get("data", b"")
-				is_final = bool(payload.get("final", False))
-				seq = self._current_seq
-				self._audio_queue.put((data, None, is_final, seq))
-			elif event == "stopped":
-				LOGGER.debug("Host reported stopped event")
-
-		def send_command(self, command: str, timeout: float = 10.0, **payload: Any) -> Dict[str, Any]:
-			if not self._host:
-				raise RuntimeError("Host not started")
-			msg_id = next(self._id_counter)
-			event = threading.Event()
-			self._pending[msg_id] = event
-			with self._send_lock:
-				try:
-					self._host.connection.send({
-						"type": "command", "id": msg_id,
-						"command": command, "payload": payload,
-					})
-				except Exception:
-					self._pending.pop(msg_id, None)
-					raise
-			if not event.wait(timeout=timeout):
-				self._pending.pop(msg_id, None)
-				LOGGER.error("Command %s timed out after %.1f seconds", command, timeout)
-				raise RuntimeError(f"Command {command} timed out")
-			response = self._responses.pop(msg_id, {"error": "no response received"})
-			if "error" in response:
-				raise RuntimeError(response["error"])
-			return response.get("payload", {})
-
-		def stop(self) -> None:
-			if not self._host:
-				return
-			self._sequence += 1
-			# 1. Signal AudioWorker to stop feeding (prevents new feed calls)
-			if self._audio_worker:
-				self._audio_worker._stopping = True
-			# 2. Immediately silence the player WITHOUT the lock.
-			#    WavePlayer.stop() is thread-safe (NVDA calls it from
-			#    MainThread while synths feed from background threads).
-			#    Using the lock would deadlock if AudioWorker is blocked
-			#    inside feed() waiting for WASAPI buffer space.
-			if self._player:
-				try:
-					self._player.stop()
-				except Exception:
-					LOGGER.exception("WavePlayer stop failed")
-			# 3. Drain audio queue so AudioWorker doesn't feed stale data
-			while not self._audio_queue.empty():
-				try:
-					self._audio_queue.get_nowait()
-					self._audio_queue.task_done()
-				except queue.Empty:
-					break
-			# 4. Fire-and-forget stop command to the host (don't block)
-			try:
-				msg_id = next(self._id_counter)
-				with self._send_lock:
-					self._host.connection.send({
-						"type": "command", "id": msg_id,
-						"command": "stop", "payload": {},
-					})
-			except Exception:
-				LOGGER.exception("Stop command failed")
-
-		def pause(self, switch: bool) -> None:
-			with self._player_lock:
-				if self._player:
-					self._player.pause(switch)
-
-		def feed_marker(self, on_done=None) -> None:
-			with self._player_lock:
-				if self._player:
-					self._player.feed(b"", onDone=on_done)
-
-		def player_idle(self) -> None:
-			with self._player_lock:
-				if self._player:
-					self._player.idle()
-
-		def shutdown(self) -> None:
-			if not self._host:
-				return
-			if self._audio_worker:
-				self._audio_worker.stop()
-				self._audio_worker.join(timeout=1)
-				self._audio_worker = None
-			with self._player_lock:
-				if self._player:
-					self._player.close()
-					self._player = None
-			try:
-				self.send_command("delete", timeout=3.0)
-			except Exception:
-				LOGGER.exception("Failed to delete host cleanly")
-			if self._receiver:
-				self._receiver.join(timeout=2)
-				self._receiver = None
-			try:
-				self._host.connection.close()
-			except Exception:
-				pass
-			try:
-				self._host.listener.close()
-			except Exception:
-				pass
-			try:
-				self._host.process.terminate()
-				self._host.process.wait(timeout=2)
-			except Exception:
-				LOGGER.exception("Failed to terminate host process")
-				try:
-					self._host.process.kill()
-				except Exception:
-					pass
-			self._host = None
-			# Reset state so ensure_started() / initialize can be called again
-			self._audio_queue = queue.Queue()
-			self._sequence = 0
-			self._current_seq = 0
-			self._pending.clear()
-			self._responses.clear()
-			self._id_counter = itertools.count(1)
-
 
 # ---------------------------------------------------------------------------
 # Module-level singleton and public API
 # ---------------------------------------------------------------------------
 
-_client: Any = SoftVoiceHostClient() if IS_64BIT else SoftVoiceDirectClient()
+_client: SoftVoiceDirectClient = SoftVoiceDirectClient()
 _on_done: Optional[Callable] = None
 _format: Dict[str, int] = {}
 _has_pause_factor: bool = False
@@ -675,7 +422,7 @@ _has_trim_silence: bool = False
 
 
 def initialize(done_callback=None) -> Dict[str, Any]:
-	"""Start the host process (64-bit) or load the DLL directly (32-bit)."""
+	"""Load the DLL and initialize the engine."""
 	global _on_done, _format, _has_pause_factor, _has_trim_silence
 	_on_done = done_callback
 
@@ -683,16 +430,7 @@ def initialize(done_callback=None) -> Dict[str, Any]:
 	tibase_path = _find_tibase32(addon_dir)
 	dll_path = os.path.join(addon_dir, "softvoice_wrapper.dll")
 
-	if IS_64BIT:
-		_client.ensure_started()
-		result = _client.send_command(
-			"initialize",
-			dllPath=dll_path,
-			tibasePath=tibase_path,
-			initialVoice=1,
-		)
-	else:
-		result = _client.do_initialize(dll_path, tibase_path, 1)
+	result = _client.do_initialize(dll_path, tibase_path, 1)
 
 	_format = result.get("format", {})
 	_has_pause_factor = result.get("hasPauseFactor", False)
@@ -720,41 +458,12 @@ def speak(text: str) -> bool:
 	# Reset AudioWorker's stopping flag so it will feed new audio
 	if _client._audio_worker:
 		_client._audio_worker._stopping = False
-	if IS_64BIT:
-		_client._current_seq = _client._sequence
-		try:
-			_client.send_command("speak", text=text, timeout=30.0)
-			return True
-		except Exception:
-			LOGGER.exception("speak command failed")
-			return False
-	else:
-		return _client.do_speak(text)
+	return _client.do_speak(text)
 
 
 def dll_call(func_name: str, value: int) -> None:
-	"""Call a sv_set* function by name (parameter setters).
-
-	On 64-bit, this is fire-and-forget: the host-side handler is an
-	atomic store via ctypes that cannot fail or block, so we don't wait
-	for a response.  This avoids deadlocking with the speak thread
-	which may be holding _send_lock while flushing audio events.
-	"""
-	if IS_64BIT:
-		if not _client._host:
-			return
-		try:
-			msg_id = next(_client._id_counter)
-			with _client._send_lock:
-				_client._host.connection.send({
-					"type": "command", "id": msg_id,
-					"command": "dllCall",
-					"payload": {"funcName": func_name, "value": value},
-				})
-		except Exception:
-			LOGGER.exception("dllCall %s failed", func_name)
-	else:
-		_client.dll_call(func_name, value)
+	"""Call a sv_set* function by name (parameter setters)."""
+	_client.dll_call(func_name, value)
 
 
 def stop() -> None:
@@ -788,16 +497,7 @@ def check() -> bool:
 	base = os.path.abspath(os.path.dirname(__file__))
 	wrapper_dll = os.path.join(base, "softvoice_wrapper.dll")
 	tibase_dll = _find_tibase32(base)
-
-	if not os.path.isfile(wrapper_dll) or not tibase_dll:
-		return False
-
-	if IS_64BIT:
-		host_exe = os.path.join(base, HOST_EXECUTABLE)
-		host_script = os.path.join(base, HOST_SCRIPT)
-		return os.path.exists(host_exe) or os.path.exists(host_script)
-	else:
-		return True
+	return os.path.isfile(wrapper_dll) and bool(tibase_dll)
 
 
 def _find_tibase32(base_path: str) -> str:
