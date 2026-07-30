@@ -24,7 +24,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 IS_64BIT = ctypes.sizeof(ctypes.c_void_p) == 8
 
 if IS_64BIT:
-	from . import _ipc
+	from . import _sv_ipc as _ipc
 
 LOGGER = logging.getLogger(__name__)
 

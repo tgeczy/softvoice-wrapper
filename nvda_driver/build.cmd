@@ -7,7 +7,7 @@ cd /d "%~dp0"
 
 echo Building 32-bit host executable...
 py -3.14-32 -m PyInstaller --onefile --noconsole --name softvoice_host32 ^
-    --add-data "synthDrivers\_ipc.py;." ^
+    --add-data "synthDrivers\_sv_ipc.py;." ^
     synthDrivers\host_softvoice32.py
 
 if errorlevel 1 (

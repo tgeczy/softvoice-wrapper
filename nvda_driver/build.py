@@ -31,7 +31,7 @@ ADDON_FILES = {
 	# SynthDriver Python files
 	"synthDrivers/sv.py": os.path.join(SYNTH_DIR, "sv.py"),
 	"synthDrivers/_softvoice.py": os.path.join(SYNTH_DIR, "_softvoice.py"),
-	"synthDrivers/_ipc.py": os.path.join(SYNTH_DIR, "_ipc.py"),
+	"synthDrivers/_sv_ipc.py": os.path.join(SYNTH_DIR, "_sv_ipc.py"),
 
 	# 32-bit host executable
 	"synthDrivers/softvoice_host32.exe": os.path.join(SYNTH_DIR, "softvoice_host32.exe"),
@@ -64,7 +64,7 @@ def main():
 
 	# Only require the Python files and manifest to exist
 	required = ["manifest.ini", "synthDrivers/sv.py", "synthDrivers/_softvoice.py",
-				"synthDrivers/_ipc.py"]
+				"synthDrivers/_sv_ipc.py"]
 	for r in required:
 		if r in [m[0] for m in missing]:
 			print(f"ERROR: Required file missing: {r}")

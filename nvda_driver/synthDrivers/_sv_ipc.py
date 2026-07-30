@@ -52,14 +52,21 @@ def create_listener() -> socket.socket:
 	return sock
 
 
+_SOCK_BUF_SIZE = 2 * 1024 * 1024  # 2 MB — enough for ~30 audio chunks
+
+
 def accept_authenticated(listener: socket.socket, authkey: bytes) -> IpcConnection:
 	conn, _ = listener.accept()
+	conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _SOCK_BUF_SIZE)
+	conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _SOCK_BUF_SIZE)
 	_authenticate_server(conn, authkey)
 	return IpcConnection(conn)
 
 
 def connect_to_listener(address: Tuple[str, int], authkey: bytes) -> IpcConnection:
 	sock = socket.create_connection(address)
+	sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _SOCK_BUF_SIZE)
+	sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _SOCK_BUF_SIZE)
 	_send_all(sock, authkey)
 	sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 	return IpcConnection(sock)

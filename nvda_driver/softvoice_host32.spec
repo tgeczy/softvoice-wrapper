@@ -5,7 +5,7 @@ a = Analysis(
     ['synthDrivers\\host_softvoice32.py'],
     pathex=[],
     binaries=[],
-    datas=[('synthDrivers\\_ipc.py', '.')],
+    datas=[('synthDrivers\\_sv_ipc.py', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

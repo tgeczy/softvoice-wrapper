@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-import _ipc
+import _sv_ipc as _ipc
 
 # Stream item types from softvoice_wrapper.h
 SV_ITEM_NONE = 0
